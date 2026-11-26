@@ -5,8 +5,9 @@
  * folder and not wherever you happened to be standing when you typed the command.
  *
  * instances stays at 1 forever. two of these running at once will fight over the
- * same players and pinball them between sides all night. if you want to balance
- * more servers, add them to the servers array, dont start a second copy.
+ * same players and pinball them between sides all night. the second one now refuses
+ * to start (theres a lockfile in the state dir), but dont lean on that. if you want
+ * to balance more servers, add them to the servers array, dont start a second copy.
  *
  * SIXFIVE
  */

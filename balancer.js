@@ -7,17 +7,11 @@
  * SIXFIVE
  */
 
-const fs = require('fs');
-const path = require('path');
+const { RED, GREEN, BLUE, FACTIONS, openSides } = require('./src/factions');
+const { mergeConfig, resolveServer } = require('./src/config');
+const { RconClient } = require('./src/api');
+const { StateStore } = require('./src/state');
 
-const RED = 'Valkyra';
-const GREEN = 'Manticore';
-const BLUE = 'Lonestar';
-const FACTIONS = [RED, GREEN, BLUE];
-
-/* the standing line. its the default broadcast, so if you never set a message
- * this is what goes out once an hour. put your own in and yours goes instead.
- * set it to "" and nothing is ever sent. no strings attached, its MIT. */
 /* how long somebody has to be missing before we actualy forget them. short enough
  * that memory stays bounded, long enough that an api blip cant wipe the lot. */
 const FORGET_AFTER_MS = 5 * 60 * 1000;
@@ -28,53 +22,16 @@ const FORGET_AFTER_MS = 5 * 60 * 1000;
  * no strings on any of that, the licence is MIT. */
 const STANDING_LINE = 'AERECRUIT.COM - the home of the 50v50';
 
-// feild names have moved between builds. add to these if it happens again.
-function factionOf(p) {
-  const f = String(p.faction || p.team || p.side || p.factionName || '').toLowerCase();
-  if (f.includes('valk')) return RED;
-  if (f.includes('mant')) return GREEN;
-  if (f.includes('lone')) return BLUE;
-  return null;
+/* counts are a map of faction -> heads, holding only the open sides. the gap is the
+ * spread across them: biggest minus smallest. with two sides thats |a - b|. */
+function spread(counts) {
+  const n = Object.values(counts);
+  return n.length ? Math.max(...n) - Math.min(...n) : 0;
 }
 
-function idOf(p) {
-  return String(p.steamId || p.steamID || p.id || p.netId || p.net_id || p.playerId || '');
-}
-
-/* a clan tag is a braket at the front. "[WOLF] someone".
- * caped at 12 charecters because someone will absolutly turn up called
- * "[i am the strongest soldier alive] dave" and he is not a clan. */
-function tagOf(p) {
-  const m = String(p.name || '').match(/^\s*\[([^\]]{1,12})\]/);
-  return m ? m[1].trim().toUpperCase() : null;
-}
-
-const opposite = (s) => (s === RED ? GREEN : RED);
-
-// six seconds. a box that cant anwser in six is having a worse night than we
-// are, and blocking here stops every other server getting looked at.
-async function request(method, server, route, body) {
-  const url = `${server.scheme || 'http'}://${server.host}:${server.port}${route}`;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), server.timeoutMs || 6000);
-  try {
-    const opts = {
-      method,
-      headers: { Authorization: 'Bearer ' + server.token },
-      signal: ctrl.signal,
-    };
-    if (body) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body);
-    }
-    const res = await fetch(url, opts);
-    if (method === 'GET') return res.ok ? await res.json() : null;
-    return res.ok;
-  } catch (e) {
-    return method === 'GET' ? null : false;
-  } finally {
-    clearTimeout(timer);
-  }
+// V26/M24, or V17/M17/L16 with three open. the initials are unique.
+function fmtCounts(counts) {
+  return Object.keys(counts).map((f) => f[0] + counts[f]).join('/');
 }
 
 /* one lot per server, they dont know about each other. writen to disk every
@@ -91,8 +48,8 @@ function blankState() {
     lastUptime: null,   // drops when the box restarts
     lastRebalanceAt: 0,
     matchStartedAt: 0,
-    matchBlueClears: 0,
-    matchPeak: { red: 0, green: 0 },
+    matchClosedClears: 0,
+    matchPeak: {},      // faction -> most heads seen on it this match
     lastAnnounceAt: 0,  // when we last shouted at the whole server
     lopsidedSince: 0,   // when the teams first went properly wrong
     warnedAt: 0,        // when we told them to sort it out
@@ -101,14 +58,25 @@ function blankState() {
 }
 
 class Balancer {
-  constructor(config, log) {
-    this.cfg = config;
-    this.log = log || (() => {});
-    this.state = {};
+  /* opts is either a log function, or { log, now, clientFor, store }. the defaults
+   * are the real thing: the global fetch, the real clock, files in stateDir.
+   * tests can hand in fakes instead of patching globals. */
+  constructor(config, opts) {
+    const o = typeof opts === 'function' ? { log: opts } : opts || {};
+    // defaults underneath, so a bare config behaves the same here as through index.js
+    this.cfg = mergeConfig(config);
+    this.log = o.log || (() => {});
+    this.now = o.now || (() => Date.now());
+    this.clientFor = o.clientFor || ((server) => new RconClient(server));
+    this.store = o.store || new StateStore(this.cfg.stateDir, { log: this.log });
+    this.clients = new Map();
+    this.failing = {};      // "server|what" -> the reason we last logged
     this.busy = false;
-    this.stateFile = path.join(config.stateDir, 'balancer-state.json');
-    this.matchFile = path.join(config.stateDir, 'match-history.json');
-    this.loadState();
+
+    this.state = this.store.load();
+    this.store.prune(this.state, this.cfg.servers.map((s) => s.name));
+    const n = Object.keys(this.state).length;
+    if (n) this.log(`picked up where we left off, ${n} server(s)`);
   }
 
   // TODO would be handy to expose match-history over http so you can see it
@@ -117,129 +85,131 @@ class Balancer {
     return this.state[key] || (this.state[key] = blankState());
   }
 
-  loadState() {
-    try {
-      const raw = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
-      for (const key of Object.keys(raw)) {
-        const st = this.stateFor(key);
-        Object.assign(st, raw[key]);
-        // older files wont have every key
-        if (!st.known) st.known = {};
-        if (!st.messaged) st.messaged = {};
-        if (!st.matchPeak) st.matchPeak = { red: 0, green: 0 };
-      }
-      const n = Object.keys(this.state).length;
-      if (n) this.log(`picked up where we left off, ${n} server(s)`);
-    } catch (e) {
-      // first run, or someone binned it. we seed fresh either way.
-    }
+  client(server) {
+    let c = this.clients.get(server.name);
+    if (!c) this.clients.set(server.name, (c = this.clientFor(server)));
+    return c;
   }
 
   saveState() {
-    try {
-      fs.mkdirSync(this.cfg.stateDir, { recursive: true });
-      fs.writeFileSync(this.stateFile, JSON.stringify(this.state));
-    } catch (e) {
-      this.log('could not write state: ' + (e.message || e));
-    }
+    this.store.save(this.state);
   }
 
-  // for when somebody swears the teams are allways stacked and you want to look
+  /* a box thats down would otherwise log the same line every two seconds all
+   * night. say it once, say it again if the reason changes, and say when its back. */
+  noteFailure(key, what, reason) {
+    const k = `${key}|${what}`;
+    if (this.failing[k] === reason) return;
+    this.failing[k] = reason;
+    this.log(`[${key}] cant read the ${what}: ${reason}`);
+  }
+
+  noteOk(key, what) {
+    const k = `${key}|${what}`;
+    if (this.failing[k] === undefined) return;
+    delete this.failing[k];
+    this.log(`[${key}] ${what} is answering again`);
+  }
+
   recordMatch(key, st, now) {
     if (!this.cfg.keepMatchHistory) return;
-    try {
-      let arr = [];
-      try { arr = JSON.parse(fs.readFileSync(this.matchFile, 'utf8')); } catch (e) {}
-      arr.push({
-        server: key,
-        endedAt: new Date(now).toISOString(),
-        durationMin: st.matchStartedAt ? Math.round((now - st.matchStartedAt) / 60000) : null,
-        map: st.matchSig,
-        peakRed: st.matchPeak.red,
-        peakGreen: st.matchPeak.green,
-        peakGap: Math.abs(st.matchPeak.red - st.matchPeak.green),
-        closedSideClears: st.matchBlueClears,
-      });
-      fs.mkdirSync(this.cfg.stateDir, { recursive: true });
-      fs.writeFileSync(this.matchFile, JSON.stringify(arr.slice(-300), null, 2));
-    } catch (e) {}
+    this.store.appendMatch({
+      server: key,
+      endedAt: new Date(now).toISOString(),
+      durationMin: st.matchStartedAt ? Math.round((now - st.matchStartedAt) / 60000) : null,
+      map: st.matchSig,
+      peak: Object.assign({}, st.matchPeak),
+      peakGap: spread(st.matchPeak),
+      closedSideClears: st.matchClosedClears,
+    });
   }
 
   /* prefrence order: their clan if its allready somewhere, then the side they
-   * picked, then whichever is emptier. anything over the cap drops out, and of
-   * whats left the first one inside the gap tolerance wins.
+   * picked, then the rest from emptiest up. anything over the cap drops out, and
+   * of whats left the first one inside the gap tolerance wins. if none are, the
+   * one that leaves the smallest gap, earlier prefrence breaking a tie.
    * it never breaks the cap to be nice to a clan. mates is lovely, 51 v 43 isnt
-   * a game. */
+   * a game.
+   *
+   * counts holds the open sides only, so the answer is always an open side. */
   chooseSide(counts, currentFaction, clanSide, limits) {
-    const baseRed = counts.red - (currentFaction === RED ? 1 : 0);
-    const baseGreen = counts.green - (currentFaction === GREEN ? 1 : 0);
-    const underCap = (X) => ((X === RED ? baseRed : baseGreen) + 1) <= limits.sideCap;
-    const gapWith = (X) =>
-      Math.abs((baseRed + (X === RED ? 1 : 0)) - (baseGreen + (X === GREEN ? 1 : 0)));
+    const sides = Object.keys(counts);
+    const base = Object.assign({}, counts);
+    if (currentFaction in base) base[currentFaction]--;      // take them out first
+    const underCap = (X) => base[X] + 1 <= limits.sideCap;
+    const gapWith = (X) => spread(Object.assign({}, base, { [X]: base[X] + 1 }));
 
-    let prefs;
-    if (clanSide) prefs = [clanSide, opposite(clanSide)];
-    else if (currentFaction === RED || currentFaction === GREEN) prefs = [currentFaction, opposite(currentFaction)];
-    else prefs = counts.red <= counts.green ? [RED, GREEN] : [GREEN, RED];
+    const lightest = sides.slice().sort((a, b) => base[a] - base[b]);   // stable, ties keep faction order
+    const prefs = [...new Set([clanSide, currentFaction, ...lightest])].filter((X) => sides.includes(X));
 
     const room = prefs.filter(underCap);
     const cands = room.length ? room : prefs;
     for (const X of cands) if (gapWith(X) <= limits.gapTolerance) return X;
-    const a = cands[0];
-    const b = cands[1] || cands[0];
-    return gapWith(a) <= gapWith(b) ? a : b;
+    let best = cands[0];
+    for (const X of cands) if (gapWith(X) < gapWith(best)) best = X;
+    return best;
+  }
+
+  /* the open side holding strictly the most of this tag, not counting the player.
+   * a tie is no prefrence at all. take them out of their own count first or
+   * everyone is a clan of one. */
+  clanSideFor(pl, tagCounts, sides) {
+    const t = pl.tag && tagCounts[pl.tag];
+    if (!t) return null;
+    let best = null, bestN = 0, tied = false;
+    for (const f of sides) {
+      const n = (t[f] || 0) - (pl.fac === f ? 1 : 0);
+      if (n > bestN) { best = f; bestN = n; tied = false; }
+      else if (n === bestN && n > 0) tied = true;
+    }
+    return tied ? null : best;
   }
 
   async processServer(server) {
     const key = server.name;
     const st = this.stateFor(key);
-    const limits = {
-      sideCap: server.sideCap != null ? server.sideCap : this.cfg.sideCap,
-      gapTolerance: server.gapTolerance != null ? server.gapTolerance : this.cfg.gapTolerance,
-    };
+    const eff = resolveServer(this.cfg, server);
+    const limits = { sideCap: eff.sideCap, gapTolerance: eff.gapTolerance };
     /* people the balancer leaves completly alone. admins mostly. an admin who
      * switches sides to go and watch somebody would otherwise get treated like a
      * stacker and put straight back, which is useless when your trying to work. */
-    const exempt = new Set(
-      [].concat(this.cfg.exempt || [], server.exempt || []).map((x) => String(x).trim()).filter(Boolean)
-    );
-    const closed = (server.closedFaction !== undefined ? server.closedFaction : this.cfg.closedFaction) || null;
-    const joinMessage = server.joinMessage !== undefined ? server.joinMessage : this.cfg.joinMessage;
-    const clanOn = server.clanGrouping != null ? server.clanGrouping : this.cfg.clanGrouping;
+    const exempt = new Set(eff.exempt);
+    const closed = eff.closedFaction;
+    const sides = openSides(closed);
+    const joinMessage = eff.joinMessage;
+    const clanOn = eff.clanGrouping;
 
-    const [data, status, health] = await Promise.all([
-      request('GET', server, '/v1/players'),
-      request('GET', server, '/v1/status'),
-      request('GET', server, '/v1/health'),
-    ]);
-    if (!data) { this.log(`[${key}] no player list. box down, wrong port, or the token is not the token.`); return; }
+    const api = this.client(server);
+    const [roster, status, health] = await Promise.all([api.players(), api.status(), api.health()]);
+    if (!roster.ok) { this.noteFailure(key, 'player list', roster.reason); return; }
+    this.noteOk(key, 'player list');
+    // without these it still balances, it just cant spot a new match as well
+    if (status.ok) this.noteOk(key, 'status'); else this.noteFailure(key, 'status', status.reason);
+    if (health.ok) this.noteOk(key, 'health'); else this.noteFailure(key, 'health', health.reason);
 
-    const rawList = Array.isArray(data.players) ? data.players : (Array.isArray(data) ? data : []);
-    const players = [];
+    const players = roster.players;
     const tagCounts = {};
-    let red = 0, green = 0;
+    const counts = {};
+    for (const f of sides) counts[f] = 0;
+    const isOpen = (fac) => sides.includes(fac);
 
-    for (const p of rawList) {
-      const id = idOf(p);
-      if (!id) continue;
-      const fac = factionOf(p);
-      const tag = tagOf(p);
-      if (fac === RED) red++; else if (fac === GREEN) green++;
-      if (tag && (fac === RED || fac === GREEN)) {
-        const t = (tagCounts[tag] = tagCounts[tag] || { [RED]: 0, [GREEN]: 0 });
-        t[fac]++;
+    for (const pl of players) {
+      if (!isOpen(pl.fac)) continue;
+      counts[pl.fac]++;
+      if (pl.tag) {
+        const t = (tagCounts[pl.tag] = tagCounts[pl.tag] || {});
+        t[pl.fac] = (t[pl.fac] || 0) + 1;
       }
-      players.push({ id, fac, tag, name: p.name });
     }
 
-    const now = Date.now();
-    const sig = status ? `${status.map || ''}|${(status.experiences || []).join(',')}` : null;
-    const scoreSum = status ? (status.factionScores || []).reduce((a, f) => a + (f.score || 0), 0) : null;
+    const now = this.now();
+    const sig = status.ok ? `${status.map}|${status.experiences.join(',')}` : null;
+    const scoreSum = status.ok ? status.scores.reduce((a, b) => a + b, 0) : null;
     // how far ahead the leader is. a lopsided server that is still a close game
     // is not hurting anybody yet, so we dont touch it.
-    const sorted = status ? (status.factionScores || []).map((f) => f.score || 0).sort((a, b) => b - a) : [];
+    const sorted = status.ok ? status.scores.slice().sort((a, b) => b - a) : [];
     const scoreLead = sorted.length >= 2 ? sorted[0] - sorted[1] : 0;
-    const uptime = health && typeof health.uptimeSeconds === 'number' ? health.uptimeSeconds : null;
+    const uptime = health.ok ? health.uptimeSeconds : null;
 
     /* first look at this server. write everyone down as settled and touch nobody.
      * what ever mess the teams are in right now, its not ours to fix. we start
@@ -251,8 +221,8 @@ class Balancer {
       st.matchSig = sig;
       st.matchScoreSum = scoreSum || 0;
       st.matchStartedAt = now;
-      st.matchPeak = { red, green };
-      st.matchBlueClears = 0;
+      st.matchPeak = Object.assign({}, counts);
+      st.matchClosedClears = 0;
       st.lastUptime = uptime;
       // start the announce clock now, so restarting the balancer doesnt fire an
       // anouncement at everyone the second it comes back up. nobody wants that.
@@ -278,8 +248,8 @@ class Balancer {
         for (const id in st.known) if (st.known[id]) st.known[id].placed = false;
         st.lastRebalanceAt = now;
         st.matchStartedAt = now;
-        st.matchPeak = { red, green };
-        st.matchBlueClears = 0;
+        st.matchPeak = Object.assign({}, counts);
+        st.matchClosedClears = 0;
         const why = restarted ? 'box restarted' : mapRotated ? 'map -> ' + sig : 'scores reset';
         this.log(`[${key}] new match (${why}), evening the teams`);
       }
@@ -287,8 +257,7 @@ class Balancer {
       st.matchSig = sig;
       st.matchScoreSum = scoreSum;
     }
-    if (red > st.matchPeak.red) st.matchPeak.red = red;
-    if (green > st.matchPeak.green) st.matchPeak.green = green;
+    for (const f of sides) if (counts[f] > (st.matchPeak[f] || 0)) st.matchPeak[f] = counts[f];
 
     /* ---------- last resort: the match is lost because the teams are broken --
      * this is the one thing that can move settled players mid match, and it does
@@ -301,21 +270,23 @@ class Balancer {
      * cant trip on 12v6, plus a minimum headcount so it leaves quiet servers be.
      *
      * and it has to actualy be costing somebody the match, hence the score lead.
-     * off by default. restarting somebody elses match uninvited is rude. */
-    const rs = Object.assign({
-      enabled: false, minPlayers: 20, minorityShare: 0.40, minGap: 8,
-      scoreLead: 15, graceMinutes: 3, warnSeconds: 90, cooldownMinutes: 15,
-      warning: 'Teams are badly unbalanced. Switch to the smaller side now or this match will be restarted.',
-    }, this.cfg.rescue || {}, server.rescue || {});
+     * off by default. restarting somebody elses match uninvited is rude.
+     *
+     * with three open sides 40% of the server on the smallest side is impossible,
+     * so the share scales: minorityShare * 2 / sides. 40% for two, 26.7% for three,
+     * the same 80% of a fair share either way. */
+    const rs = eff.rescue;
 
-    if (rs.enabled && closed !== null) {
-      const big = Math.max(red, green), small = Math.min(red, green), tot = big + small;
-      const lopsided = tot >= rs.minPlayers && (big - small) >= rs.minGap && (small / tot) < rs.minorityShare;
+    if (rs.enabled) {
+      const vals = sides.map((f) => counts[f]);
+      const big = Math.max(...vals), small = Math.min(...vals), tot = vals.reduce((a, b) => a + b, 0);
+      const line = rs.minorityShare * 2 / sides.length;
+      const lopsided = tot >= rs.minPlayers && (big - small) >= rs.minGap && (small / tot) < line;
       const cooling = now - (st.lastRestartAt || 0) < rs.cooldownMinutes * 60000;
 
       if (!lopsided) {
         // sorted itself out, or people did as they were asked. forget it happened.
-        if (st.warnedAt) this.log(`[${key}] teams recovered (R${red}/G${green}), no restart`);
+        if (st.warnedAt) this.log(`[${key}] teams recovered (${fmtCounts(counts)}), no restart`);
         st.lopsidedSince = 0; st.warnedAt = 0;
       } else if (!cooling) {
         if (!st.lopsidedSince) {
@@ -325,15 +296,16 @@ class Balancer {
             st.warnedAt = now;
             if (this.cfg.dryRun) this.log(`[${key}] WOULD WARN: ${rs.warning}`);
             else {
-              await request('POST', server, '/v1/broadcast', { message: rs.warning });
-              this.log(`[${key}] warned: R${red}/G${green}, leader up ${scoreLead}. ${rs.warnSeconds}s to fix it.`);
+              const r = await api.broadcast(rs.warning);
+              if (r.ok) this.log(`[${key}] warned: ${fmtCounts(counts)}, leader up ${scoreLead}. ${rs.warnSeconds}s to fix it.`);
+              else this.log(`[${key}] rescue warning FAILED (${r.reason}). restart still due in ${rs.warnSeconds}s.`);
             }
           } else if (now - st.warnedAt >= rs.warnSeconds * 1000) {
             // they had their chance
-            if (this.cfg.dryRun) this.log(`[${key}] WOULD RESTART MATCH (R${red}/G${green})`);
+            if (this.cfg.dryRun) this.log(`[${key}] WOULD RESTART MATCH (${fmtCounts(counts)})`);
             else {
-              const ok = await request('POST', server, '/v1/match/restart', {});
-              this.log(`[${key}] ${ok ? 'restarted the match' : 'match restart FAILED'} on R${red}/G${green}`);
+              const r = await api.restartMatch();
+              this.log(`[${key}] ${r.ok ? 'restarted the match' : `match restart FAILED (${r.reason})`} on ${fmtCounts(counts)}`);
             }
             st.lastRestartAt = now; st.lopsidedSince = 0; st.warnedAt = 0;
           }
@@ -344,7 +316,7 @@ class Balancer {
     /* leave announce.message alone and it sends the default line. set it and
      * yours goes out instead. set it to "" and nothing is ever sent.
      * minPlayers stops it shouting at an empty box at 4am. */
-    const ann = Object.assign({}, this.cfg.announce || {}, server.announce || {});
+    const ann = eff.announce;
     const annMsg = String(ann.message === undefined ? STANDING_LINE : ann.message).trim();
     if (annMsg) {
       const everyMs = Math.max(1, Number(ann.everyMinutes) || 60) * 60000;
@@ -355,16 +327,16 @@ class Balancer {
         if (this.cfg.dryRun) {
           this.log(`[${key}] WOULD ANNOUNCE: ${annMsg}`);
         } else {
-          const ok = await request('POST', server, '/v1/broadcast', { message: annMsg });
-          this.log(`[${key}] ${ok ? 'announced' : 'announce FAILED'}: ${annMsg}`);
+          const r = await api.broadcast(annMsg);
+          this.log(`[${key}] ${r.ok ? 'announced' : `announce FAILED (${r.reason})`}: ${annMsg}`);
         }
       }
     }
 
     // tried 1s polling early on. made no diference to how even it stayed and
     // just hammered the box, 2 is fine.
-    const moveCooldown = this.cfg.moveCooldownSeconds * 1000;
-    const bounceCooldown = this.cfg.bounceCooldownSeconds * 1000;
+    const moveCooldown = eff.moveCooldownSeconds * 1000;
+    const bounceCooldown = eff.bounceCooldownSeconds * 1000;
 
     for (const pl of players) {
       // exempt: write down where they are and move on. no placing, no bouncing,
@@ -381,34 +353,28 @@ class Balancer {
       if (isNew && joinMessage && !st.messaged[pl.id]) {
         st.messaged[pl.id] = now;
         if (!this.cfg.dryRun) {
-          request('POST', server, `/v1/players/${pl.id}/message`, { message: joinMessage }).catch(() => {});
+          api.message(pl.id, joinMessage);      // fire and forget, a missed welcome is no loss
         }
       }
 
       let placed = prev ? !!prev.placed : false;
 
-      // take them out of their own count first or everyone is a clan of one
-      let clanSide = null;
-      if (clanOn && pl.tag && tagCounts[pl.tag]) {
-        const cr = tagCounts[pl.tag][RED] - (pl.fac === RED ? 1 : 0);
-        const cg = tagCounts[pl.tag][GREEN] - (pl.fac === GREEN ? 1 : 0);
-        if (cr + cg > 0) clanSide = cr > cg ? RED : cg > cr ? GREEN : null;
-      }
+      const clanSide = clanOn ? this.clanSideFor(pl, tagCounts, sides) : null;
 
       let target = null;
       let forced = false;
-      const counts = { red, green };
 
       if (closed && pl.fac === closed) {
-        // third side is shut. they get moved every time, no waiting about.
-        const side = this.chooseSide(counts, closed, clanSide, limits);
-        if (side !== closed) { target = side; forced = true; }
-      } else if ((pl.fac === RED || pl.fac === GREEN) && !placed) {
+        // that side is shut. they get moved every time, no waiting about.
+        // chooseSide only ever answers with an open side.
+        target = this.chooseSide(counts, closed, clanSide, limits);
+        forced = true;
+      } else if (isOpen(pl.fac) && !placed) {
         // new arival, or everyone just after a match boundry. place them properly.
         const side = this.chooseSide(counts, pl.fac, clanSide, limits);
         if (side !== pl.fac) target = side;
         placed = true;
-      } else if ((pl.fac === RED || pl.fac === GREEN) && placed && prev && prev.fac !== pl.fac) {
+      } else if (isOpen(pl.fac) && placed && prev && prev.fac !== pl.fac) {
         /* the closed door.
          *
          * this is the one that stops stacking. a settled player who switches sides
@@ -418,12 +384,20 @@ class Balancer {
          *
          * and note it only ever fires on someone who moved themselfs. a player who
          * is just playing is never touched. thats the whole promise and its why
-         * this is safe to leave runing. */
-        const onto = pl.fac === RED ? red : green;
-        const from = pl.fac === RED ? green : red;
+         * this is safe to leave runing.
+         *
+         * heavier means heavier than the side they left. if they didnt leave an
+         * open side (they came off the closed one) its the lightest other open side,
+         * and they get placed properly instead of being sent back where they were,
+         * because where they were is shut. */
+        const onto = counts[pl.fac];
+        const cameFromOpen = isOpen(prev.fac);
+        const from = cameFromOpen
+          ? counts[prev.fac]
+          : Math.min(...sides.filter((f) => f !== pl.fac).map((f) => counts[f]));
         if (onto > limits.sideCap || onto - from > limits.gapTolerance) {
-          target = prev.fac;
-          forced = true;
+          const side = cameFromOpen ? prev.fac : this.chooseSide(counts, pl.fac, clanSide, limits);
+          if (side !== pl.fac) { target = side; forced = true; }
         }
       }
 
@@ -438,20 +412,20 @@ class Balancer {
           continue;
         }
 
-        const ok = await request('PATCH', server, `/v1/players/${pl.id}`, { faction: target });
-        if (ok) {
+        const r = await api.move(pl.id, target);
+        if (r.ok) {
           // keep the tally straight so the rest of this pass desides against
           // whats real and not what the roster said ten moves back
-          if (closed && pl.fac === closed) st.matchBlueClears++;
-          if (pl.fac === RED) red--; else if (pl.fac === GREEN) green--;
-          if (target === RED) red++; else if (target === GREEN) green++;
+          if (closed && pl.fac === closed) st.matchClosedClears++;
+          if (isOpen(pl.fac)) counts[pl.fac]--;
+          counts[target]++;
           st.known[pl.id] = { fac: target, movedAt: now, placed: true };
-          this.log(`[${key}] moved ${label} ${pl.fac} -> ${target} (${why}) now R${red}/G${green}`);
+          this.log(`[${key}] moved ${label} ${pl.fac} -> ${target} (${why}) now ${fmtCounts(counts)}`);
         } else {
           // leave movedAt alone so we retry, instead of sitting on a cooldown we
           // never earned
           st.known[pl.id] = { fac: pl.fac, movedAt: prev ? prev.movedAt || 0 : 0, placed };
-          this.log(`[${key}] move FAILED ${label} ${pl.fac} -> ${target}`);
+          this.log(`[${key}] move FAILED ${label} ${pl.fac} -> ${target} (${r.reason})`);
         }
       } else {
         st.known[pl.id] = { fac: pl.fac, movedAt: prev ? prev.movedAt || 0 : 0, placed };
@@ -500,7 +474,10 @@ class Balancer {
     }
   }
 
+  /* takes the lock first. a second copy against the same stateDir throws here
+   * instead of quietly fighting the first one over every player. */
   start() {
+    this.store.acquireLock();
     const every = Math.max(1, this.cfg.pollSeconds) * 1000;
     const names = this.cfg.servers.filter((s) => s.enabled !== false).map((s) => s.name);
     this.log(
@@ -515,7 +492,9 @@ class Balancer {
 
   stop() {
     if (this.timer) clearInterval(this.timer);
+    this.timer = null;
     this.saveState();
+    this.store.releaseLock();
   }
 }
 
