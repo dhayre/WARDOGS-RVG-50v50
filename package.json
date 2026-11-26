@@ -28,6 +28,7 @@
   "files": [
     "index.js",
     "balancer.js",
+    "src/",
     "selftest.js",
     "stress.js",
     "config.example.json",

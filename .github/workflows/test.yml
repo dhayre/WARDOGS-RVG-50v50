@@ -23,7 +23,10 @@ jobs:
         run: |
           node --check index.js
           node --check balancer.js
+          node --check src/factions.js
+          node --check src/config.js
           node --check selftest.js
+          node --check stress.js
           node --check ecosystem.config.js
 
       - name: the example config is valid json

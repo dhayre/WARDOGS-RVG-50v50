@@ -22,9 +22,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { Balancer, RED, GREEN, BLUE, STANDING_LINE } = require('./balancer');
+const { Balancer, FACTIONS, RED, GREEN, BLUE, STANDING_LINE } = require('./balancer');
 
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, known = 0;
 const results = [];
 
 function check(name, got, want) {
@@ -32,6 +32,21 @@ function check(name, got, want) {
   if (ok) { pass++; results.push(`  PASS  ${name}`); }
   else { fail++; results.push(`  FAIL  ${name}\n          got:  ${JSON.stringify(got)}\n          want: ${JSON.stringify(want)}`); }
 }
+
+/* a bug we know about and have a test for, but havent fixed yet. it gets reported
+ * without failing the run. once it starts passing it DOES fail, so somebody turns
+ * it into a normal check() instead of leaving it here forever. */
+function knownBug(name, got, want) {
+  const ok = JSON.stringify(got) === JSON.stringify(want);
+  if (ok) { fail++; results.push(`  FAIL  ${name}\n          now passing. its fixed, change knownBug() to check().`); }
+  else { known++; results.push(`  KNOWN ${name}\n          got:  ${JSON.stringify(got)}\n          want: ${JSON.stringify(want)}`); }
+}
+
+const count = (world, fac) => world.players.filter((p) => p.fac === fac).length;
+const spreadOf = (world, sides) => {
+  const n = sides.map((f) => count(world, f));
+  return Math.max(...n) - Math.min(...n);
+};
 
 /* ---------- the fake server -----------------------------------------------
  * just enough of the API to fool the balancer. it remembers who got moved so we
@@ -108,7 +123,8 @@ function makeBalancer(overrides) {
     joinMessage: 'hello', keepMatchHistory: false, stateDir: dir,
     servers: [{ name: 'test', host: '127.0.0.1', port: 1, token: 't' }],
   }, overrides || {});
-  return { bal: new Balancer(cfg, () => {}), cfg, dir };
+  const logs = [];
+  return { bal: new Balancer(cfg, (line) => logs.push(line)), cfg, dir, logs };
 }
 
 /* build a block of players. the offset per faction has to be distinct or green and
@@ -277,15 +293,16 @@ function team(n, fac, prefix) {
     check('join message sent once per player', world.messages.filter(x => x === '999005').length, 1);
   }
 
-  // 14. closedFaction null and the third side is nobodys business.
+  // 14. closedFaction null means three real sides. a joiner goes to the lightest one,
+  //     third side included. it used to ignore the third side completly.
   {
-    const world = fakeServer({ players: [...team(25, RED), ...team(25, GREEN)] });
+    const world = fakeServer({ players: [...team(20, RED), ...team(20, GREEN), ...team(15, BLUE)] });
     installStub(world);
     const { bal } = makeBalancer({ closedFaction: null });
     await bal.tick();
-    world.players.push({ id: '999006', name: 'Blue', fac: BLUE });
+    world.players.push({ id: '999006', name: 'Third', fac: RED });
     await bal.tick();
-    check('with no closed faction the third side is left alone', world.moves.length, 0);
+    check('three open: a joiner goes to the lightest of the three', world.moves.map(m => [m.id, m.to]), [['999006', BLUE]]);
   }
 
   // 15. it NEVER puts anyone on the closed side. not once, not ever, whatever the
@@ -502,8 +519,8 @@ function team(n, fac, prefix) {
 
   // ---- the rescue: warn, give them a chance, then restart the round ----------
   // helper: drive a world to a given score lead and run the clock forward
-  async function rescueRun(red, green, lead, opts) {
-    const world = fakeServer({ players: [...team(red, RED), ...team(green, GREEN, 'G')] });
+  async function rescueRun(red, green, lead, opts, blue) {
+    const world = fakeServer({ players: [...team(red, RED), ...team(green, GREEN, 'G'), ...team(blue || 0, BLUE, 'B')] });
     world.scoreLead = lead;
     installStub(world);
     const { bal } = makeBalancer(Object.assign({
@@ -578,6 +595,145 @@ function team(n, fac, prefix) {
     check('rescue is off unless you switch it on', [world.broadcasts.length, world.restarts], [0, 0]);
   }
 
+  // ---- any faction can be the closed one, or none ---------------------------
+  // the config has always taken closedFaction, but until 1.1 only Lonestar worked.
+  // every rule below is run once per choice of closed side.
+  const open = (closed) => FACTIONS.filter((f) => f !== closed);
+
+  // 36. a joiner on the closed side goes to the lighter open side, whichever is shut
+  {
+    const got = {}, want = {};
+    for (const closed of FACTIONS) {
+      const [a, b] = open(closed);
+      const world = fakeServer({ players: [...team(25, a), ...team(20, b)] });
+      installStub(world);
+      const { bal } = makeBalancer({ closedFaction: closed });
+      await bal.tick();
+      world.players.push({ id: '999101', name: 'WrongDoor', fac: closed });
+      await bal.tick();
+      got[closed] = world.moves.map(m => [m.id, m.to]);
+      want[closed] = [['999101', b]];
+    }
+    check('any closed faction: a joiner on it goes to the lighter open side', got, want);
+  }
+
+  // 37. at a match boundary the closed side empties and the open two even up
+  {
+    const got = {}, want = {};
+    for (const closed of FACTIONS) {
+      const sides = open(closed);
+      const world = fakeServer({ players: [...team(20, closed, 'C'), ...team(22, sides[0], 'A'), ...team(8, sides[1], 'B')] });
+      installStub(world);
+      const { bal } = makeBalancer({ closedFaction: closed });
+      await bal.tick();
+      world.map = 'Ozeti';
+      await bal.tick();
+      await bal.tick();
+      got[closed] = { onClosed: count(world, closed), sentToClosed: world.moves.filter(m => m.to === closed).length,
+                      even: spreadOf(world, sides) <= 3 };
+      want[closed] = { onClosed: 0, sentToClosed: 0, even: true };
+    }
+    check('any closed faction: a boundary empties it and evens the other two', got, want);
+  }
+
+  // 38. the closed door works whichever side is shut
+  {
+    const got = {}, want = {};
+    for (const closed of FACTIONS) {
+      const [a, b] = open(closed);
+      const world = fakeServer({ players: [...team(30, a), ...team(20, b, 'B')] });
+      installStub(world);
+      const { bal } = makeBalancer({ closedFaction: closed });
+      await bal.tick();
+      world.players.find((p) => p.fac === b).fac = a;    // jumps onto the heavy side
+      await bal.tick();
+      got[closed] = world.moves.map(m => [m.from, m.to]);
+      want[closed] = [[a, b]];
+    }
+    check('any closed faction: switching onto the heavier side is bounced back', got, want);
+  }
+
+  // 39. REGRESSION. somebody seeded on the closed side who hops onto the heavy side
+  //     before we clear them used to get bounced straight back ONTO the closed side.
+  {
+    const world = fakeServer({ players: [...team(30, RED), ...team(20, GREEN, 'G'), ...team(1, BLUE, 'B')] });
+    installStub(world);
+    const { bal } = makeBalancer();
+    await bal.tick();                                    // seeded, blue guy marked settled
+    world.players.find((p) => p.fac === BLUE).fac = RED; // hops onto the heavy side himself
+    await bal.tick();
+    check('the closed door never bounces anybody onto the closed side',
+      world.moves.map(m => [m.from, m.to]), [[RED, GREEN]]);
+  }
+
+  // 40. three open: a boundary evens all three, not just two of them
+  {
+    const world = fakeServer({ players: [...team(30, RED), ...team(15, GREEN, 'G'), ...team(5, BLUE, 'B')] });
+    installStub(world);
+    const { bal } = makeBalancer({ closedFaction: null });
+    await bal.tick();
+    world.map = 'Ozeti';
+    await bal.tick();
+    await bal.tick();
+    check('three open: a boundary evens all three sides', spreadOf(world, FACTIONS) <= 3, true);
+  }
+
+  // 41. three open: the closed door compares the side you jumped to with the side
+  //     you left. heavier is bounced, lighter is fine.
+  {
+    const world = fakeServer({ players: [...team(20, RED), ...team(20, GREEN, 'G'), ...team(15, BLUE, 'B')] });
+    installStub(world);
+    const { bal } = makeBalancer({ closedFaction: null });
+    await bal.tick();
+    world.players.find((p) => p.fac === BLUE).fac = RED;    // 15 -> 20 side, makes it worse
+    await bal.tick();
+    const bounced = world.moves.map(m => [m.from, m.to]);
+    world.moves.length = 0;
+    world.players.find((p) => p.fac === GREEN).fac = BLUE;  // 20 -> 15 side, helps
+    await bal.tick();
+    check('three open: onto a heavier side is bounced, onto a lighter one is allowed',
+      [bounced, world.moves.length], [[[RED, BLUE]], 0]);
+  }
+
+  // 42. three open: a clan member still finds the clan
+  {
+    const world = fakeServer({ players: [...team(20, RED), ...team(18, GREEN, 'G'), ...team(20, BLUE, 'B')] });
+    world.players.push({ id: '888101', name: '[OWLS] a', fac: GREEN });
+    world.players.push({ id: '888102', name: '[OWLS] b', fac: GREEN });
+    installStub(world);
+    const { bal } = makeBalancer({ closedFaction: null });
+    await bal.tick();
+    world.players.push({ id: '888103', name: '[OWLS] c', fac: RED });
+    await bal.tick();
+    check('three open: a clan member joins their clan', world.moves.map(m => [m.id, m.to]), [['888103', GREEN]]);
+  }
+
+  // 43. three open: rescue scales the minority line to three sides. 40% of the server
+  //     on the small side is impossible with three, so the line is 40% * 2/3.
+  {
+    const broken = await rescueRun(30, 30, 40, { closedFaction: null }, 10);   // 10 of 70 = 14%
+    const fine = await rescueRun(30, 26, 40, { closedFaction: null }, 22);     // 22 of 78 = 28%
+    check('three open: rescue fires on a collapsed side, not on a fair three way',
+      [broken.warned, broken.restarts, fine.warned, fine.restarts], [1, 1, 0, 0]);
+  }
+
+  // 44. dry run has to say what a real run would do. it used to judge every player
+  //     against the starting counts, so a 35/15 boundary read as 35 moves, not ~9.
+  {
+    const run = async (dryRun) => {
+      const world = fakeServer({ players: [...team(35, RED), ...team(15, GREEN, 'G')] });
+      installStub(world);
+      const { bal, logs } = makeBalancer({ dryRun });
+      await bal.tick();
+      world.map = 'Ozeti';
+      await bal.tick();
+      return dryRun ? logs.filter((l) => l.includes('WOULD MOVE')).length : world.moves.length;
+    };
+    const real = await run(false);
+    const dry = await run(true);
+    knownBug('dry run reports the same number of moves a real run makes', dry, real);
+  }
+
   /* 34 and 35 drive the real index.js instead of a copy of its logic. a test that
    * re implements the thing its testing passes happily while the actual file is
    * broken, which is how the shallow merge slipped past me in the first place.
@@ -618,8 +774,57 @@ function team(n, fac, prefix) {
   }
   fs.rmSync(cfgDir, { recursive: true, force: true });
 
+  // ---- config rules, called directly ----------------------------------------
+  const { loadConfig, resolveServer } = require('./src/config');
+  const srv = (extra) => Object.assign({ name: 's', host: '10.0.0.5', port: 7779, token: 'Hx8kQ2mVp' }, extra || {});
+  const errorsFor = (raw) => loadConfig(raw, {}).errors;
+
+  // 45. per server overrides get the same checks as the global block. a server could
+  //     switch rescue on with a minorityShare of 0.9 and --check said fine.
+  {
+    const rescue = errorsFor({ servers: [srv({ rescue: { enabled: true, minorityShare: 0.9 } })] });
+    const closed = errorsFor({ servers: [srv({ closedFaction: 'Lonestarr' })] });
+    check('per server rescue and closedFaction are validated',
+      [rescue.length === 1 && rescue[0].startsWith('servers[0] ("s"): rescue.minorityShare'),
+       closed.length === 1 && closed[0].startsWith('servers[0] ("s"): closedFaction "Lonestarr"')],
+      [true, true]);
+  }
+
+  // 46. a bad global value is reported once, not once more for every server
+  check('a bad global setting is reported once',
+    errorsFor({ gapTolerance: -1, servers: [srv({ name: 'a' }), srv({ name: 'b' })] }),
+    ['gapTolerance has to be 0 or more.']);
+
+  // 47. rescue with three open sides is allowed now that the maths scales
+  check('rescue is accepted with all three sides open',
+    errorsFor({ closedFaction: null, rescue: { enabled: true }, servers: [srv()] }), []);
+
+  // 48. cooldowns can be set per server, and a typo in one is caught instead of
+  //     silently meaning nobody is ever moved
+  {
+    const cfg = loadConfig({ servers: [srv({ moveCooldownSeconds: 10 })] }, {}).cfg;
+    check('cooldowns override per server, and junk in them is rejected',
+      [resolveServer(cfg, cfg.servers[0]).moveCooldownSeconds,
+       errorsFor({ servers: [srv({ bounceCooldownSeconds: '5s' })] }).length],
+      [10, 1]);
+  }
+
+  // 49. a 1.0.0 state file still loads. peaks were red/green and the clear count was
+  //     called blue. losing that file would re seed, which is safe, but pointless.
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wdb-old-'));
+    fs.writeFileSync(path.join(dir, 'balancer-state.json'), JSON.stringify({
+      test: { known: {}, messaged: {}, seeded: true, matchPeak: { red: 31, green: 28 }, matchBlueClears: 4 },
+    }));
+    const { bal } = makeBalancer({ stateDir: dir });
+    const st = bal.state['test'];
+    check('a 1.0.0 state file is migrated on load',
+      [st.matchPeak, st.matchClosedClears, 'matchBlueClears' in st],
+      [{ [RED]: 31, [GREEN]: 28 }, 4, false]);
+  }
+
   console.log('\nwd-balancer self-test\n');
   console.log(results.join('\n'));
-  console.log(`\n  ${pass} passed, ${fail} failed\n`);
+  console.log(`\n  ${pass} passed, ${fail} failed${known ? `, ${known} known bug(s)` : ""}\n`);
   process.exit(fail ? 1 : 0);
 })();
