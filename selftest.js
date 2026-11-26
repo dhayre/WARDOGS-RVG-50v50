@@ -24,6 +24,9 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { Balancer, FACTIONS, RED, GREEN, BLUE, STANDING_LINE } = require('./balancer');
 
+// node's own fetch, kept before any test swaps the global for a fake server
+const nodeFetch = globalThis.fetch;
+
 let pass = 0, fail = 0, known = 0;
 const results = [];
 
@@ -821,6 +824,134 @@ function team(n, fac, prefix) {
     check('a 1.0.0 state file is migrated on load',
       [st.matchPeak, st.matchClosedClears, 'matchBlueClears' in st],
       [{ [RED]: 31, [GREEN]: 28 }, 4, false]);
+  }
+
+  // ---- the RCON client and the state store -----------------------------------
+  const { RconClient } = require('./src/api');
+  const box = { name: 'b', host: '10.0.0.5', port: 7779, token: 't' };
+  const clientWith = (fetch) => new RconClient(box, { fetch });
+
+  // 50. when a box wont answer, the log says why. "box down, wrong port, or the
+  //     token is not the token" sent people hunting in three places at once.
+  {
+    const refused = Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+    const reasons = [
+      (await clientWith(async () => ({ ok: false, status: 401 })).players()).reason,
+      (await clientWith(async () => { throw refused; }).players()).reason,
+      (await clientWith(async () => { throw Object.assign(new Error('x'), { name: 'AbortError' }); }).players()).reason,
+      (await clientWith(async () => ({ ok: true, json: async () => ({ nope: 1 }) })).players()).reason,
+      // the real fetch, not a stub: port 1 is on fetchs blocked list, so this never
+      // leaves the machine
+      (await new RconClient(Object.assign({}, box, { host: '127.0.0.1', port: 1 }), { fetch: nodeFetch }).players()).reason,
+    ];
+    check('a failed call says why: bad token, refused, timed out, garbage, blocked port',
+      reasons.map((r) => r.split(/[.(]/)[0].trim()),
+      ['refused', 'connection refused', 'timed out after 6s', 'player list was not in a shape we recognise',
+       'that port is one fetch will not connect to at all']);
+  }
+
+  // 51. a dead box is logged once, not every two seconds all night, and coming
+  //     back is logged too
+  {
+    const world = fakeServer({ players: [...team(25, RED), ...team(25, GREEN, 'G')] });
+    installStub(world);
+    const realFetch = globalThis.fetch;
+    const { bal, logs } = makeBalancer();
+    await bal.tick();
+    globalThis.fetch = async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); };
+    await bal.tick();
+    await bal.tick();
+    await bal.tick();
+    globalThis.fetch = realFetch;
+    await bal.tick();
+    check('a down box is logged once, and again when it comes back',
+      [logs.filter((l) => l.includes('cant read the player list')).length,
+       logs.filter((l) => l.includes('player list is answering again')).length],
+      [1, 1]);
+  }
+
+  // 52. the balancer runs on whatever client and clock it is handed. no globals.
+  {
+    let clock = 1000;
+    const fake = {
+      players: async () => ({ ok: true, players: [{ id: '1', fac: RED, tag: null, name: 'a' }] }),
+      status: async () => ({ ok: true, map: 'M', experiences: [], scores: [0, 0, 0] }),
+      health: async () => ({ ok: true, uptimeSeconds: 10 }),
+    };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wdb-inj-'));
+    const bal = new Balancer({ stateDir: dir, keepMatchHistory: false, servers: [{ name: 'x', host: 'h', port: 1, token: 't' }] },
+      { clientFor: () => fake, now: () => clock });
+    await bal.tick();
+    check('clock and client can be injected', [bal.state['x'].seeded, bal.state['x'].matchStartedAt], [true, 1000]);
+  }
+
+  // 53. state is written whole or not at all, in the versioned format, and a file
+  //     that cant be read is moved aside and said out loud instead of silently
+  //     re seeding
+  {
+    const world = fakeServer({ players: [...team(25, RED), ...team(25, GREEN, 'G')] });
+    installStub(world);
+    const { bal, dir } = makeBalancer();
+    await bal.tick();
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, 'balancer-state.json'), 'utf8'));
+    const leftovers = fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+
+    fs.writeFileSync(path.join(dir, 'balancer-state.json'), '{"test": {"known": {');   // half a file
+    const again = makeBalancer({ stateDir: dir });
+    check('state is saved atomically, versioned, and a corrupt file is set aside loudly',
+      [saved.schema, Object.keys(saved.servers), leftovers.length,
+       fs.existsSync(path.join(dir, 'balancer-state.json.corrupt')),
+       again.logs.some((l) => l.startsWith('state file could not be read')),
+       Object.keys(again.bal.state).length],
+      [2, ['test'], 0, true, true, 0]);
+  }
+
+  // 54. a server taken out of the config is forgotten, a parked one is not
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wdb-prune-'));
+    fs.writeFileSync(path.join(dir, 'balancer-state.json'), JSON.stringify({
+      schema: 2, servers: { test: { seeded: true }, parked: { seeded: true }, gone: { seeded: true } },
+    }));
+    const { bal, logs } = makeBalancer({ stateDir: dir, servers: [
+      { name: 'test', host: '127.0.0.1', port: 1, token: 't' },
+      { name: 'parked', host: '127.0.0.1', port: 1, token: 't', enabled: false },
+    ] });
+    check('state for removed servers is pruned, parked servers keep theirs',
+      [Object.keys(bal.state).sort(), logs.some((l) => l.includes('no longer in the config: gone'))],
+      [['parked', 'test'], true]);
+  }
+
+  // 55. two copies on one state dir pinball players between sides, so the second
+  //     refuses to start. a lock left by a dead process, or by this same pid in a
+  //     previous life (containers are pid 1 every time), is taken over.
+  {
+    const world = fakeServer({ players: [...team(25, RED), ...team(25, GREEN, 'G')] });
+    installStub(world);
+    const a = makeBalancer();
+    const b = makeBalancer({ stateDir: a.dir });
+    const lock = path.join(a.dir, 'balancer.lock');
+    const tryStart = (x) => { try { x.bal.start(); return 'started'; } catch (e) { return 'refused'; } };
+
+    const first = tryStart(a);
+    const second = tryStart(b);
+    a.bal.stop();
+    const afterStop = tryStart(b);
+    b.bal.stop();
+
+    fs.writeFileSync(lock, JSON.stringify({ pid: 2147483646, host: os.hostname() }));      // long dead
+    const deadPid = tryStart(a);
+    a.bal.stop();
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, host: os.hostname() }));     // us, last boot
+    const ownPid = tryStart(a);
+    a.bal.stop();
+    fs.writeFileSync(lock, JSON.stringify({ pid: 1, host: 'some-other-box' }));            // cant check it
+    const otherHost = tryStart(a);
+    a.bal.stop();
+    await new Promise((r) => setTimeout(r, 20));        // let the ticks start() kicked off finish
+
+    check('a second copy is refused, stale locks are taken over, foreign ones are not',
+      [first, second, afterStop, deadPid, ownPid, otherHost, fs.existsSync(lock)],
+      ['started', 'refused', 'started', 'started', 'started', 'refused', true]);
   }
 
   console.log('\nwd-balancer self-test\n');

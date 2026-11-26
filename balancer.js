@@ -7,10 +7,10 @@
  * SIXFIVE
  */
 
-const fs = require('fs');
-const path = require('path');
-const { RED, GREEN, BLUE, FACTIONS, factionOf, openSides } = require('./src/factions');
+const { RED, GREEN, BLUE, FACTIONS, openSides } = require('./src/factions');
 const { mergeConfig, resolveServer } = require('./src/config');
+const { RconClient } = require('./src/api');
+const { StateStore } = require('./src/state');
 
 /* how long somebody has to be missing before we actualy forget them. short enough
  * that memory stays bounded, long enough that an api blip cant wipe the lot. */
@@ -22,18 +22,6 @@ const FORGET_AFTER_MS = 5 * 60 * 1000;
  * no strings on any of that, the licence is MIT. */
 const STANDING_LINE = 'AERECRUIT.COM - the home of the 50v50';
 
-function idOf(p) {
-  return String(p.steamId || p.steamID || p.id || p.netId || p.net_id || p.playerId || '');
-}
-
-/* a clan tag is a braket at the front. "[WOLF] someone".
- * caped at 12 charecters because someone will absolutly turn up called
- * "[i am the strongest soldier alive] dave" and he is not a clan. */
-function tagOf(p) {
-  const m = String(p.name || '').match(/^\s*\[([^\]]{1,12})\]/);
-  return m ? m[1].trim().toUpperCase() : null;
-}
-
 /* counts are a map of faction -> heads, holding only the open sides. the gap is the
  * spread across them: biggest minus smallest. with two sides thats |a - b|. */
 function spread(counts) {
@@ -44,32 +32,6 @@ function spread(counts) {
 // V26/M24, or V17/M17/L16 with three open. the initials are unique.
 function fmtCounts(counts) {
   return Object.keys(counts).map((f) => f[0] + counts[f]).join('/');
-}
-
-// six seconds. a box that cant anwser in six is having a worse night than we
-// are, and blocking here stops every other server getting looked at.
-async function request(method, server, route, body) {
-  const url = `${server.scheme || 'http'}://${server.host}:${server.port}${route}`;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), server.timeoutMs || 6000);
-  try {
-    const opts = {
-      method,
-      headers: { Authorization: 'Bearer ' + server.token },
-      signal: ctrl.signal,
-    };
-    if (body) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body);
-    }
-    const res = await fetch(url, opts);
-    if (method === 'GET') return res.ok ? await res.json() : null;
-    return res.ok;
-  } catch (e) {
-    return method === 'GET' ? null : false;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /* one lot per server, they dont know about each other. writen to disk every
@@ -96,15 +58,25 @@ function blankState() {
 }
 
 class Balancer {
-  constructor(config, log) {
+  /* opts is either a log function, or { log, now, clientFor, store }. the defaults
+   * are the real thing: the global fetch, the real clock, files in stateDir.
+   * tests can hand in fakes instead of patching globals. */
+  constructor(config, opts) {
+    const o = typeof opts === 'function' ? { log: opts } : opts || {};
     // defaults underneath, so a bare config behaves the same here as through index.js
     this.cfg = mergeConfig(config);
-    this.log = log || (() => {});
-    this.state = {};
+    this.log = o.log || (() => {});
+    this.now = o.now || (() => Date.now());
+    this.clientFor = o.clientFor || ((server) => new RconClient(server));
+    this.store = o.store || new StateStore(this.cfg.stateDir, { log: this.log });
+    this.clients = new Map();
+    this.failing = {};      // "server|what" -> the reason we last logged
     this.busy = false;
-    this.stateFile = path.join(config.stateDir, 'balancer-state.json');
-    this.matchFile = path.join(config.stateDir, 'match-history.json');
-    this.loadState();
+
+    this.state = this.store.load();
+    this.store.prune(this.state, this.cfg.servers.map((s) => s.name));
+    const n = Object.keys(this.state).length;
+    if (n) this.log(`picked up where we left off, ${n} server(s)`);
   }
 
   // TODO would be handy to expose match-history over http so you can see it
@@ -113,59 +85,43 @@ class Balancer {
     return this.state[key] || (this.state[key] = blankState());
   }
 
-  loadState() {
-    try {
-      const raw = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
-      for (const key of Object.keys(raw)) {
-        const st = this.stateFor(key);
-        Object.assign(st, raw[key]);
-        // older files wont have every key
-        if (!st.known) st.known = {};
-        if (!st.messaged) st.messaged = {};
-        if (!st.matchPeak) st.matchPeak = {};
-        // 1.0.0 files: peaks were red/green only, and the clear count was called blue
-        if ('red' in st.matchPeak || 'green' in st.matchPeak) {
-          st.matchPeak = { [RED]: st.matchPeak.red || 0, [GREEN]: st.matchPeak.green || 0 };
-        }
-        if (st.matchBlueClears !== undefined) {
-          st.matchClosedClears = st.matchBlueClears;
-          delete st.matchBlueClears;
-        }
-      }
-      const n = Object.keys(this.state).length;
-      if (n) this.log(`picked up where we left off, ${n} server(s)`);
-    } catch (e) {
-      // first run, or someone binned it. we seed fresh either way.
-    }
+  client(server) {
+    let c = this.clients.get(server.name);
+    if (!c) this.clients.set(server.name, (c = this.clientFor(server)));
+    return c;
   }
 
   saveState() {
-    try {
-      fs.mkdirSync(this.cfg.stateDir, { recursive: true });
-      fs.writeFileSync(this.stateFile, JSON.stringify(this.state));
-    } catch (e) {
-      this.log('could not write state: ' + (e.message || e));
-    }
+    this.store.save(this.state);
   }
 
-  // for when somebody swears the teams are allways stacked and you want to look
+  /* a box thats down would otherwise log the same line every two seconds all
+   * night. say it once, say it again if the reason changes, and say when its back. */
+  noteFailure(key, what, reason) {
+    const k = `${key}|${what}`;
+    if (this.failing[k] === reason) return;
+    this.failing[k] = reason;
+    this.log(`[${key}] cant read the ${what}: ${reason}`);
+  }
+
+  noteOk(key, what) {
+    const k = `${key}|${what}`;
+    if (this.failing[k] === undefined) return;
+    delete this.failing[k];
+    this.log(`[${key}] ${what} is answering again`);
+  }
+
   recordMatch(key, st, now) {
     if (!this.cfg.keepMatchHistory) return;
-    try {
-      let arr = [];
-      try { arr = JSON.parse(fs.readFileSync(this.matchFile, 'utf8')); } catch (e) {}
-      arr.push({
-        server: key,
-        endedAt: new Date(now).toISOString(),
-        durationMin: st.matchStartedAt ? Math.round((now - st.matchStartedAt) / 60000) : null,
-        map: st.matchSig,
-        peak: Object.assign({}, st.matchPeak),
-        peakGap: spread(st.matchPeak),
-        closedSideClears: st.matchClosedClears,
-      });
-      fs.mkdirSync(this.cfg.stateDir, { recursive: true });
-      fs.writeFileSync(this.matchFile, JSON.stringify(arr.slice(-300), null, 2));
-    } catch (e) {}
+    this.store.appendMatch({
+      server: key,
+      endedAt: new Date(now).toISOString(),
+      durationMin: st.matchStartedAt ? Math.round((now - st.matchStartedAt) / 60000) : null,
+      map: st.matchSig,
+      peak: Object.assign({}, st.matchPeak),
+      peakGap: spread(st.matchPeak),
+      closedSideClears: st.matchClosedClears,
+    });
   }
 
   /* prefrence order: their clan if its allready somewhere, then the side they
@@ -223,43 +179,37 @@ class Balancer {
     const joinMessage = eff.joinMessage;
     const clanOn = eff.clanGrouping;
 
-    const [data, status, health] = await Promise.all([
-      request('GET', server, '/v1/players'),
-      request('GET', server, '/v1/status'),
-      request('GET', server, '/v1/health'),
-    ]);
-    if (!data) { this.log(`[${key}] no player list. box down, wrong port, or the token is not the token.`); return; }
+    const api = this.client(server);
+    const [roster, status, health] = await Promise.all([api.players(), api.status(), api.health()]);
+    if (!roster.ok) { this.noteFailure(key, 'player list', roster.reason); return; }
+    this.noteOk(key, 'player list');
+    // without these it still balances, it just cant spot a new match as well
+    if (status.ok) this.noteOk(key, 'status'); else this.noteFailure(key, 'status', status.reason);
+    if (health.ok) this.noteOk(key, 'health'); else this.noteFailure(key, 'health', health.reason);
 
-    const rawList = Array.isArray(data.players) ? data.players : (Array.isArray(data) ? data : []);
-    const players = [];
+    const players = roster.players;
     const tagCounts = {};
     const counts = {};
     for (const f of sides) counts[f] = 0;
     const isOpen = (fac) => sides.includes(fac);
 
-    for (const p of rawList) {
-      const id = idOf(p);
-      if (!id) continue;
-      const fac = factionOf(p);
-      const tag = tagOf(p);
-      if (isOpen(fac)) {
-        counts[fac]++;
-        if (tag) {
-          const t = (tagCounts[tag] = tagCounts[tag] || {});
-          t[fac] = (t[fac] || 0) + 1;
-        }
+    for (const pl of players) {
+      if (!isOpen(pl.fac)) continue;
+      counts[pl.fac]++;
+      if (pl.tag) {
+        const t = (tagCounts[pl.tag] = tagCounts[pl.tag] || {});
+        t[pl.fac] = (t[pl.fac] || 0) + 1;
       }
-      players.push({ id, fac, tag, name: p.name });
     }
 
-    const now = Date.now();
-    const sig = status ? `${status.map || ''}|${(status.experiences || []).join(',')}` : null;
-    const scoreSum = status ? (status.factionScores || []).reduce((a, f) => a + (f.score || 0), 0) : null;
+    const now = this.now();
+    const sig = status.ok ? `${status.map}|${status.experiences.join(',')}` : null;
+    const scoreSum = status.ok ? status.scores.reduce((a, b) => a + b, 0) : null;
     // how far ahead the leader is. a lopsided server that is still a close game
     // is not hurting anybody yet, so we dont touch it.
-    const sorted = status ? (status.factionScores || []).map((f) => f.score || 0).sort((a, b) => b - a) : [];
+    const sorted = status.ok ? status.scores.slice().sort((a, b) => b - a) : [];
     const scoreLead = sorted.length >= 2 ? sorted[0] - sorted[1] : 0;
-    const uptime = health && typeof health.uptimeSeconds === 'number' ? health.uptimeSeconds : null;
+    const uptime = health.ok ? health.uptimeSeconds : null;
 
     /* first look at this server. write everyone down as settled and touch nobody.
      * what ever mess the teams are in right now, its not ours to fix. we start
@@ -346,15 +296,16 @@ class Balancer {
             st.warnedAt = now;
             if (this.cfg.dryRun) this.log(`[${key}] WOULD WARN: ${rs.warning}`);
             else {
-              await request('POST', server, '/v1/broadcast', { message: rs.warning });
-              this.log(`[${key}] warned: ${fmtCounts(counts)}, leader up ${scoreLead}. ${rs.warnSeconds}s to fix it.`);
+              const r = await api.broadcast(rs.warning);
+              if (r.ok) this.log(`[${key}] warned: ${fmtCounts(counts)}, leader up ${scoreLead}. ${rs.warnSeconds}s to fix it.`);
+              else this.log(`[${key}] rescue warning FAILED (${r.reason}). restart still due in ${rs.warnSeconds}s.`);
             }
           } else if (now - st.warnedAt >= rs.warnSeconds * 1000) {
             // they had their chance
             if (this.cfg.dryRun) this.log(`[${key}] WOULD RESTART MATCH (${fmtCounts(counts)})`);
             else {
-              const ok = await request('POST', server, '/v1/match/restart', {});
-              this.log(`[${key}] ${ok ? 'restarted the match' : 'match restart FAILED'} on ${fmtCounts(counts)}`);
+              const r = await api.restartMatch();
+              this.log(`[${key}] ${r.ok ? 'restarted the match' : `match restart FAILED (${r.reason})`} on ${fmtCounts(counts)}`);
             }
             st.lastRestartAt = now; st.lopsidedSince = 0; st.warnedAt = 0;
           }
@@ -376,8 +327,8 @@ class Balancer {
         if (this.cfg.dryRun) {
           this.log(`[${key}] WOULD ANNOUNCE: ${annMsg}`);
         } else {
-          const ok = await request('POST', server, '/v1/broadcast', { message: annMsg });
-          this.log(`[${key}] ${ok ? 'announced' : 'announce FAILED'}: ${annMsg}`);
+          const r = await api.broadcast(annMsg);
+          this.log(`[${key}] ${r.ok ? 'announced' : `announce FAILED (${r.reason})`}: ${annMsg}`);
         }
       }
     }
@@ -402,7 +353,7 @@ class Balancer {
       if (isNew && joinMessage && !st.messaged[pl.id]) {
         st.messaged[pl.id] = now;
         if (!this.cfg.dryRun) {
-          request('POST', server, `/v1/players/${pl.id}/message`, { message: joinMessage }).catch(() => {});
+          api.message(pl.id, joinMessage);      // fire and forget, a missed welcome is no loss
         }
       }
 
@@ -461,8 +412,8 @@ class Balancer {
           continue;
         }
 
-        const ok = await request('PATCH', server, `/v1/players/${pl.id}`, { faction: target });
-        if (ok) {
+        const r = await api.move(pl.id, target);
+        if (r.ok) {
           // keep the tally straight so the rest of this pass desides against
           // whats real and not what the roster said ten moves back
           if (closed && pl.fac === closed) st.matchClosedClears++;
@@ -474,7 +425,7 @@ class Balancer {
           // leave movedAt alone so we retry, instead of sitting on a cooldown we
           // never earned
           st.known[pl.id] = { fac: pl.fac, movedAt: prev ? prev.movedAt || 0 : 0, placed };
-          this.log(`[${key}] move FAILED ${label} ${pl.fac} -> ${target}`);
+          this.log(`[${key}] move FAILED ${label} ${pl.fac} -> ${target} (${r.reason})`);
         }
       } else {
         st.known[pl.id] = { fac: pl.fac, movedAt: prev ? prev.movedAt || 0 : 0, placed };
@@ -523,7 +474,10 @@ class Balancer {
     }
   }
 
+  /* takes the lock first. a second copy against the same stateDir throws here
+   * instead of quietly fighting the first one over every player. */
   start() {
+    this.store.acquireLock();
     const every = Math.max(1, this.cfg.pollSeconds) * 1000;
     const names = this.cfg.servers.filter((s) => s.enabled !== false).map((s) => s.name);
     this.log(
@@ -538,7 +492,9 @@ class Balancer {
 
   stop() {
     if (this.timer) clearInterval(this.timer);
+    this.timer = null;
     this.saveState();
+    this.store.releaseLock();
   }
 }
 

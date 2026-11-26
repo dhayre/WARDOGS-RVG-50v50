@@ -586,7 +586,14 @@ server chat, wich helps nobody.
 In `stateDir`:
 
 - `balancer-state.json`, the per server memory. Safe to delete while its stopped. If you
-  do, it just re seeds and leaves the current round alone.
+  do, it just re seeds and leaves the current round alone. Its writen to a temp file and
+  renamed into place, so a crash mid write leaves the last good copy. If it ever cant be
+  read, its renamed to `balancer-state.json.corrupt`, the log says so, and it re seeds.
+  Servers you take out of the config are forgotten on the next start; parked ones
+  (`enabled: false`) are kept.
+- `balancer.lock`, while its running. A second copy pointed at the same `stateDir`
+  refuses to start, becuase two balancers fight over every player. A lock left behind by
+  a crash is taken over automatically.
 - `match-history.json`, the last 300 matches with how long they ran, peak players a side
   (`peak`, keyed by faction), the worst gap it reached and how many times the closed side
   had to be cleared. Handy
@@ -620,9 +627,24 @@ one.
 
 ## When it goes wrong
 
-**`no player list. box down, wrong port, or the token is not the token.`**
-The RCON call failed. Check the host, check the port, check the password, and check the
-machine running this can actualy reach that port. Nine times out of ten its the port.
+**`cant read the player list: ...`**
+The RCON call failed, and the end of the line says how. It's logged once, not every
+poll, and you get `player list is answering again` when it recovers.
+
+| it says | look at |
+|---|---|
+| `refused (401)` or `(403)` | the token. its the RCON password, not your game or admin one |
+| `not found (404)` | the port. thats probably the game port, not the RCON port |
+| `connection refused` | the port, or RCON isnt switched on in the server config |
+| `connection timed out` / `timed out after 6s` | a firewall between here and there |
+| `host not found` | the host in your config |
+| `that port is one fetch will not connect to` | the port. a few (22, 25, 6000, 6667...) are blocked outright, pick another |
+| `player list was not in a shape we recognise` | the game build changed its API. open an issue |
+
+**`another copy is allready running against ...`**
+Exactly that. Stop the other one. If you are sure nothing else is running, delete the
+`balancer.lock` file it names. It only says this for a live process, or for a lock writen
+from a different machine on shared storage, wich it cant check.
 
 **Its not moving anyone.** The first round after startup is left alone on purpose. Wait
 for a map change. Also check you didnt leave `--dry-run` on.

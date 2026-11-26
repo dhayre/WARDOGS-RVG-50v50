@@ -128,4 +128,10 @@ function shutdown(sig) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-bal.start();
+// the only way start fails is the lock: another copy is allready on this state
+try {
+  bal.start();
+} catch (e) {
+  console.error(`\n  ${e.message}\n`);
+  process.exit(1);
+}

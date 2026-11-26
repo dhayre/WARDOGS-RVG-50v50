@@ -26,6 +26,20 @@ changes if I break your config, the second if theres somthing new, the third for
 - `match-history.json` records `peak` as a map keyed by faction instead of `peakRed` and
   `peakGreen`. State files from 1.0.0 are migrated on load.
 - Config handling moved to `src/config.js` and the faction table to `src/factions.js`.
+- When a server wont answer, the log says why: bad token, wrong port, refused, timed out,
+  DNS, or a payload it doesnt recognise. Each failure is logged once rather than every
+  poll, and recovery is logged too. Failed moves, announcements and rescue calls carry the
+  reason as well.
+- A player list in a shape it doesnt recognise is treated as a failed read, not as an
+  empty server.
+- The state file is writen atomically (temp file and rename) in a versioned format,
+  `{ "schema": 2, "servers": { ... } }`. An unreadable state file is moved to
+  `balancer-state.json.corrupt` and logged instead of silently re seeding. Servers removed
+  from the config are forgotten on start.
+- A lockfile in `stateDir` stops a second copy running against the same state. Stale
+  locks from a crash, or from a container restart reusing the pid, are taken over.
+- RCON calls moved to `src/api.js` and state handling to `src/state.js`. `Balancer`
+  accepts `{ log, now, clientFor, store }` as well as a bare log function.
 
 **Known**
 

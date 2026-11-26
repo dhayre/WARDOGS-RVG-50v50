@@ -48,10 +48,10 @@ src/
                 validate -> string[], loadConfig                             [done]
   api.js        RconClient: players(), status(), health(), move(), message(),
                 broadcast(), restartMatch(). Normalises payloads (idOf, tagOf)
-                and returns { ok, status, reason } instead of null/false.
+                and returns { ok, status, reason } instead of null/false.    [done]
   state.js      StateStore: load/save via tmp file + rename, schema version and
                 migration, pruning of servers no longer configured, a lockfile
-                so two instances cannot run against one stateDir.
+                so two instances cannot run against one stateDir.            [done]
   policy/       pure functions, no I/O, no clock reads:
     match.js      detectBoundary(prevState, snapshot)
     placement.js  chooseSide(), clanSide(), bounce decision
@@ -116,8 +116,23 @@ for problems the global block does not already have.
 
 ### Dependencies are passed in
 
-From step 3 the balancer takes `{ client, now, log }` instead of reaching for
-`globalThis.fetch` and `Date.now`. Tests and the stress harness inject fakes directly.
+From step 3 the balancer takes `{ log, now, clientFor, store }`, or a bare log function
+as before. The defaults are the real thing: an `RconClient` that calls whatever
+`globalThis.fetch` is at call time, `Date.now`, and a `StateStore` on `stateDir`. That
+keeps the 1.x tests running unchanged through step 4; step 5 moves them to injected fakes.
+
+### State on disk
+
+`balancer-state.json` is `{ schema: 2, servers: { name: state } }`. A 1.0.0 file (a bare
+map) is read and migrated. Writes go to a temp file that is renamed into place, without
+`fsync`: that made each save about 20 times slower, and the only thing it protects
+against (power loss) at worst leaves an unreadable file, which is moved aside to
+`.corrupt` before seeding fresh. Seeding never moves anybody, so that failure is safe.
+
+`balancer.lock` holds the pid, host and a per-instance token. A lock is stale, and taken
+over, when its pid is dead, or when it names this process's own pid but this process
+doesn't hold it (a container restart reuses pid 1). A lock from another host can't be
+checked, so it holds.
 
 ### Still zero dependencies
 
@@ -140,14 +155,18 @@ Each step leaves `node selftest.js` and `node stress.js 10` green.
    `announce`, `closedFaction` and cooldowns are validated; cooldowns can be overridden
    per server; rescue no longer requires a closed faction. `processServer()` uses
    `openSides()` and count maps throughout. State files from 1.0.0 are migrated on load.
-3. **`src/api.js` and `src/state.js`.** RCON client with real error reasons (401,
-   timeout, refused) in the log. Atomic state writes, schema version, pruning, lockfile.
-   Balancer takes injected `client`, `now` and `log`; tests stop patching globals.
+3. **[done] `src/api.js` and `src/state.js`.** RCON client with real error reasons (401,
+   404, refused, timeout, DNS, unrecognised payload) in the log, each logged once and
+   again on recovery. A player list in an unrecognised shape is now a failed read rather
+   than an empty server. Atomic state writes, schema version, pruning, lockfile. The
+   balancer accepts injected `log`, `now`, `clientFor` and `store`, with defaults that
+   keep the existing tests unchanged.
 4. **Policy modules and executor.** Split `processServer()` into `policy/*` and
    `executor.js` as above. Fixes the dry run bug; promote its test. Move entry points
    into `src/` and `bin/`.
-5. **Tests on `node:test`.** Port `selftest.js` scenarios one for one, add unit tests for
-   the pure policy functions, keep `stress.js` as the invariant campaign.
+5. **Tests on `node:test`.** Port `selftest.js` scenarios one for one, switch them from
+   patching `globalThis.fetch` and `Date.now` to injected fakes, add unit tests for the
+   pure policy functions, keep `stress.js` as the invariant campaign.
 6. **Features**, from the list below.
 
 ## Possible features
@@ -156,8 +175,6 @@ Roughly in order of value for effort.
 
 - **Dry run summary.** "Would end at 26/24 after 9 moves" per tick with any moves. Nearly
   free after step 4.
-- **Specific connection errors.** "401: wrong token", "timed out after 6s", "connection
-  refused". Comes with step 3.
 - **Reload config on `SIGHUP`** without losing state.
 - **Read-only status endpoint** (the TODO in `balancer.js`): current counts, recent
   actions, match history. Opt-in and bound to `127.0.0.1` by default, because the tool's
