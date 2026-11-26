@@ -49,8 +49,8 @@ That last one is the only call in here that interupts people, which is why `resc
 switched off and why the validator is fussy about its settings. With `rescue` off it is six
 calls and none of them can end a round.
 
-It has no dependencies, no telemetry, and it dosent call home. Its two small files, you
-can read the whole thing in ten minutes and check that yourself. Dont take my word for it.
+It has no dependencies, no telemetry, and it dosent call home. Its a handful of small
+files, you can read the whole thing in ten minutes and check that yourself. Dont take my word for it.
 
 ## found somthing
 

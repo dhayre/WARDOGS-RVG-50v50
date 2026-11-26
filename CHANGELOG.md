@@ -3,6 +3,53 @@
 Newest at the top. Version numbers follow [semver](https://semver.org): the first number
 changes if I break your config, the second if theres somthing new, the third for fixes.
 
+## Unreleased
+
+**Fixed**
+
+- Dry run overstated moves at a match boundary, because it judged every player against
+  the starting head counts. At 35 v 15 it reported 35 moves where a real run makes 9. It
+  now reports the same moves a real run would make, and only once.
+- `closedFaction` only worked when it was `Lonestar`. With `Valkyra` or `Manticore` closed
+  it never cleared the closed side and could move players onto it. Any of the three works
+  now.
+- `closedFaction: null` ignored the third side instead of balancing it. All three sides are
+  balanced now: placement, the closed door, clans, match boundaries and rescue.
+- The closed door could bounce somebody back onto the closed side if they had been seeded
+  there and switched before being cleared. They get placed properly now.
+- Per server `rescue`, `announce`, `closedFaction` and cooldowns were never validated. They
+  are now, with the same rules as the global settings.
+
+**Changed**
+
+- `--check` lists every problem in the config at once instead of stopping at the first.
+- `moveCooldownSeconds` and `bounceCooldownSeconds` can be set per server. A non-number in
+  either is rejected; before, it meant nobody was ever moved.
+- Rescue works with three open sides. `minorityShare` scales to `minorityShare * 2 / 3`.
+- `match-history.json` records `peak` as a map keyed by faction instead of `peakRed` and
+  `peakGreen`. State files from 1.0.0 are migrated on load.
+- Config handling moved to `src/config.js` and the faction table to `src/factions.js`.
+- When a server wont answer, the log says why: bad token, wrong port, refused, timed out,
+  DNS, or a payload it doesnt recognise. Each failure is logged once rather than every
+  poll, and recovery is logged too. Failed moves, announcements and rescue calls carry the
+  reason as well.
+- A player list in a shape it doesnt recognise is treated as a failed read, not as an
+  empty server.
+- The state file is writen atomically (temp file and rename) in a versioned format,
+  `{ "schema": 2, "servers": { ... } }`. An unreadable state file is moved to
+  `balancer-state.json.corrupt` and logged instead of silently re seeding. Servers removed
+  from the config are forgotten on start.
+- A lockfile in `stateDir` stops a second copy running against the same state. Stale
+  locks from a crash, or from a container restart reusing the pid, are taken over.
+- RCON calls moved to `src/api.js` and state handling to `src/state.js`. `Balancer`
+  accepts `{ log, now, clientFor, store }` as well as a bare log function.
+
+- Deciding and doing are split. `src/policy/` holds the rules as pure functions and
+  `planTick()` returns a list of actions; `src/executor.js` carries them out, or logs them
+  in a dry run. The code moved into `src/` and the CLI into `bin/wd-balancer.js`.
+  `index.js` and `balancer.js` stay at the root, so `node index.js` and existing service
+  files work unchanged.
+
 ## 1.0.0
 
 First public release.

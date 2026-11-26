@@ -21,10 +21,7 @@ jobs:
 
       - name: syntax
         run: |
-          node --check index.js
-          node --check balancer.js
-          node --check selftest.js
-          node --check ecosystem.config.js
+          for f in $(git ls-files '*.js'); do node --check "$f" || exit 1; done
 
       - name: the example config is valid json
         run: node -e "JSON.parse(require('fs').readFileSync('config.example.json','utf8'))"
