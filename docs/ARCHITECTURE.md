@@ -139,7 +139,21 @@ for problems the global block does not already have.
 From step 3 the balancer takes `{ log, now, clientFor, store }`, or a bare log function
 as before. The defaults are the real thing: an `RconClient` that calls whatever
 `globalThis.fetch` is at call time, `Date.now`, and a `StateStore` on `stateDir`. That
-keeps the 1.x tests running unchanged through step 4; step 5 moves them to injected fakes.
+kept the 1.x tests running unchanged through step 4.
+
+Since step 5 the tests patch nothing global. `test/helpers.js` builds a `FakeServer` and
+hands the balancer a real `RconClient` whose `fetch` is that fake server, so payload
+parsing is still exercised, plus a clock the test moves on by hand. `stress.js` does the
+same.
+
+### Tests
+
+`node selftest.js` (or `npm test`) runs Node's built-in test runner over `test/*.test.js`.
+The wrapper stays because the README tells server owners to run it before trusting the
+tool. Files are by area: `rules`, `rescue-announce`, `config`, `state` and `api` run
+scenarios against the fake server; `policy` unit-tests the pure functions in
+`src/policy/` with no server, balancer or clock. `stress.js` is the randomised invariant
+campaign and is unchanged in what it checks.
 
 ### State on disk
 
@@ -187,9 +201,14 @@ Each step leaves `node selftest.js` and `node stress.js 10` green.
    confirm a dry run doesn't repeat them on later ticks. New tests cover a refused move
    being retried and `planTick()` leaving its input alone. Code moved to `src/` and
    `bin/`, with shims at the root.
-5. **Tests on `node:test`.** Port `selftest.js` scenarios one for one, switch them from
-   patching `globalThis.fetch` and `Date.now` to injected fakes, add unit tests for the
-   pure policy functions, keep `stress.js` as the invariant campaign.
+5. **[done] Tests on `node:test`.** All 58 `selftest.js` checks are ported under the same
+   names, now driven by an injected fake server and clock instead of patched globals.
+   Tests that used to edit timestamps in state now move the clock forward instead. 46 new
+   tests cover the pure policy functions, payload parsing, `tokenEnv`, per-server
+   `closedFaction: null`, `stateDir` resolution and the match history. Breaking three rules
+   on purpose (the old dry-run bug, the closed door, seeding) showed each is caught; that
+   exercise also found both seeding tests passing for the wrong reason, now fixed.
+   `stress.js` uses injection too and produces identical output for the same seeds.
 6. **Features**, from the list below.
 
 ## Possible features

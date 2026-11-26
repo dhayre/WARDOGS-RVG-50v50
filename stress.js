@@ -32,6 +32,7 @@ const os = require('os');
 const path = require('path');
 
 const { Balancer, FACTIONS, RED, GREEN, BLUE } = require('./balancer');
+const { RconClient } = require('./src/api');
 
 /* ---------- deterministic PRNG so every failure is reproducible ---------- */
 function rng(seed) {
@@ -44,10 +45,9 @@ function rng(seed) {
   };
 }
 
-/* ---------- fake clock so we can simulate hours in milliseconds ---------- */
-const realNow = Date.now;
+/* ---------- fake clock so we can simulate hours in milliseconds ----------
+ * handed to the balancer as its clock. nothing global is touched. */
 let CLOCK = 1700000000000;
-Date.now = () => CLOCK;
 function advance(ms) { CLOCK += ms; }
 
 /* ---------- a simulated WARDOGS server ----------------------------------- */
@@ -70,8 +70,9 @@ function makeWorld(rand, opts) {
   return { players, map: 'Bakurani', scores: 120, uptime: 9000, moves: [], broadcasts: [], restarts: 0, down: false, malformed: false };
 }
 
-function installStub(world) {
-  globalThis.fetch = async (url, opt) => {
+// the fake server's side of the RCON api, handed to a real RconClient as its fetch
+function fakeFetch(world) {
+  return async (url, opt) => {
     const method = (opt && opt.method) || 'GET';
     const route = new URL(url).pathname;
     if (world.down) throw new Error('ECONNREFUSED');
@@ -112,7 +113,7 @@ async function run(seed, cfgOverrides, churn, ticks) {
     blue: Math.floor(rand() * 8),
     clans: Math.floor(rand() * 4),
   });
-  installStub(world);
+  const fetch = fakeFetch(world);
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stress-'));
   const cfg = Object.assign({
@@ -122,7 +123,11 @@ async function run(seed, cfgOverrides, churn, ticks) {
     announce: { everyMinutes: 60, minPlayers: 1 },
     servers: [{ name: 's', host: '10.0.0.1', port: 7779, token: 't' }],
   }, cfgOverrides || {});
-  const bal = new Balancer(cfg, () => {});
+  const bal = new Balancer(cfg, {
+    log: () => {},
+    now: () => CLOCK,
+    clientFor: (server) => new RconClient(server, { fetch }),
+  });
   const closed = cfg.closedFaction || null;
   const open = FACTIONS.filter((f) => f !== closed);
   const spread = () => {
@@ -322,8 +327,6 @@ async function run(seed, cfgOverrides, churn, ticks) {
       meanTicksToSettle: mean(stats.settle).toFixed(1),
     });
   }
-
-  Date.now = realNow;
 
   console.log('\nwd-balancer stress campaign\n');
   console.log(`  ${totalRuns} randomised runs, ${totalTicks} ticks, ${RUNS_PER_PROFILE} seeds per profile\n`);

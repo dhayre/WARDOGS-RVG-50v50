@@ -4,7 +4,7 @@
 [![licence MIT](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
 [![node 18+](https://img.shields.io/badge/node-18%2B-green)](https://nodejs.org)
 [![dependencies 0](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
-[![tests 36](https://img.shields.io/badge/tests-36%20passing-brightgreen)](selftest.js)
+[![tests 104](https://img.shields.io/badge/tests-104%20passing-brightgreen)](test/)
 
 
 Keeps the teams even on a WARDOGS server with out draging people out of a fight.
@@ -25,7 +25,7 @@ exists becuase somthing went wrong first. This is that logic pulled out into som
 can run on your own box.
 
 Being straight with you about what that means: **the rules are proven, this exact package
-is not yet.** It has 36 tests, and a stress harness that throws 660 randomised matches at it
+is not yet.** It has 104 tests, and a stress harness that throws 840 randomised matches at it
 looking for any case where it breaks its own promises, and finds none. Both of those ship
 with it, so you dont have to take my word for either: `npm test` and `npm run stress`.
 
@@ -275,10 +275,10 @@ and checks every rule. It never touches the network:
 node selftest.js
 ```
 
-You should get `36 passed, 0 failed`. If you dont, somthings wrong with your Node install,
-not with your server.
+It finishes with a summary, and the line that matters is `fail 0`. If you dont get that,
+somthings wrong with your Node install, not with your server.
 
-If you want to push it harder, `npm run stress` makes up 660 random servers with people
+If you want to push it harder, `npm run stress` makes up 840 random servers with people
 joining, quitting and team hopping all over the place, and checks after every single tick
 that none of the promises above got broken. Takes a couple of minutes. It prints the seed
 for anything that fails, so a failure is reproducible rather than a ghost.

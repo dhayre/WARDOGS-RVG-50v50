@@ -44,6 +44,10 @@ changes if I break your config, the second if theres somthing new, the third for
 - RCON calls moved to `src/api.js` and state handling to `src/state.js`. `Balancer`
   accepts `{ log, now, clientFor, store }` as well as a bare log function.
 
+- Tests run on Node's built-in test runner, from `test/`, one file per area, with an
+  injected fake server and clock instead of patched globals. `node selftest.js` still
+  works and runs them all. 104 tests, up from 36 in 1.0.0, including unit tests for every
+  rule function.
 - Deciding and doing are split. `src/policy/` holds the rules as pure functions and
   `planTick()` returns a list of actions; `src/executor.js` carries them out, or logs them
   in a dry run. The code moved into `src/` and the CLI into `bin/wd-balancer.js`.

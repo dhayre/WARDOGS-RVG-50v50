@@ -5,7 +5,7 @@
 ## Checklist
 
 - [ ] `node selftest.js` passes
-- [ ] If Ive added behaviour, theres a test for it in `selftest.js`
+- [ ] If Ive added behaviour, theres a test for it in `test/`
 - [ ] If Ive changed somthing the readme describes, Ive updated the readme too
 - [ ] I havent made it possible to move a settled player mid match
 
