@@ -100,9 +100,12 @@ class StateStore {
 
   save(servers) {
     try {
-      fs.mkdirSync(this.dir, { recursive: true });
+      // once is enough. if somebody deletes the dir while its running the write
+      // fails, says so, and the next save makes it again.
+      if (!this.dirReady) { fs.mkdirSync(this.dir, { recursive: true }); this.dirReady = true; }
       writeAtomic(this.stateFile, JSON.stringify({ schema: SCHEMA, servers }));
     } catch (e) {
+      this.dirReady = false;
       this.log('could not write state: ' + (e.message || e));
     }
   }

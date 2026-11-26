@@ -7,6 +7,9 @@ changes if I break your config, the second if theres somthing new, the third for
 
 **Fixed**
 
+- Dry run overstated moves at a match boundary, because it judged every player against
+  the starting head counts. At 35 v 15 it reported 35 moves where a real run makes 9. It
+  now reports the same moves a real run would make, and only once.
 - `closedFaction` only worked when it was `Lonestar`. With `Valkyra` or `Manticore` closed
   it never cleared the closed side and could move players onto it. Any of the three works
   now.
@@ -41,11 +44,11 @@ changes if I break your config, the second if theres somthing new, the third for
 - RCON calls moved to `src/api.js` and state handling to `src/state.js`. `Balancer`
   accepts `{ log, now, clientFor, store }` as well as a bare log function.
 
-**Known**
-
-- Dry run still overstates moves at a match boundary, because it never updates its counts
-  as it goes. There's a test for it, and the fix comes with the planned split between
-  deciding and doing in `docs/ARCHITECTURE.md`.
+- Deciding and doing are split. `src/policy/` holds the rules as pure functions and
+  `planTick()` returns a list of actions; `src/executor.js` carries them out, or logs them
+  in a dry run. The code moved into `src/` and the CLI into `bin/wd-balancer.js`.
+  `index.js` and `balancer.js` stay at the root, so `node index.js` and existing service
+  files work unchanged.
 
 ## 1.0.0
 

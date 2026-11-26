@@ -692,7 +692,7 @@ stacked side.
 
 **"A brand new account wants my RCON password."** Reasonable suspicion. So: zero
 dependencies, nothing to install, a handful of small files you can read in ten minutes, and the only
-address it ever contacts is the one in your own config. Read `balancer.js` and check. The
+address it ever contacts is the one in your own config. Read `src/` and check. The
 whole point of shipping it small is that you dont have to trust me.
 
 **"Keeping clans together is just stacking."** Its the sharpest criticism of the lot. The

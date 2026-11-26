@@ -52,19 +52,24 @@ src/
   state.js      StateStore: load/save via tmp file + rename, schema version and
                 migration, pruning of servers no longer configured, a lockfile
                 so two instances cannot run against one stateDir.            [done]
-  policy/       pure functions, no I/O, no clock reads:
-    match.js      detectBoundary(prevState, snapshot)
-    placement.js  chooseSide(), clanSide(), bounce decision
-    rescue.js     the warn/restart state machine
-    announce.js   isDue()
-    plan.js       planTick(snapshot, state, serverCfg, now) -> { actions, nextState }
-  executor.js   applies actions through RconClient, or logs them in dry run
-  balancer.js   orchestration: poll, plan, execute, save
-bin/wd-balancer.js   argv parsing and log formatting only
+  policy/       pure functions, no I/O, no clock reads:                      [done]
+    counts.js     tally(), spread(), fmtCounts()
+    match.js      readSnapshot(), detectBoundary()
+    placement.js  chooseSide(), clanSideFor(), bounceTarget()
+    rescue.js     isLopsided(), rescueStep(): the warn/restart state machine
+    announce.js   dueAnnouncement(), STANDING_LINE
+    plan.js       planTick(snapshot, state, serverCfg, now)
+                    -> { state, actions, counts, notes, finishedMatch }
+  executor.js   applies actions through RconClient, or logs them in dry run [done]
+  balancer.js   orchestration: poll, plan, execute, save                     [done]
+bin/wd-balancer.js   the CLI: argv, config errors, --check, signals         [done]
+balancer.js     shim: require('./src/balancer')
+index.js        shim: require('./bin/wd-balancer.js')
 ```
 
-`balancer.js` and `index.js` stay at the repo root until step 4 so that the package entry
-points and the test imports keep working during the transition.
+The two root shims stay for good. `node index.js` is in the README, in the systemd and
+pm2 examples, and in units people have already deployed, and `balancer.js` is the
+package's `main`.
 
 ## Design decisions
 
@@ -100,10 +105,25 @@ How each rule generalises to N open sides:
 
 ### Decide, then do
 
-Step 4 splits `processServer()` into a pure `planTick()` that returns a list of actions
-and updates its own tallies as it goes, and an executor that performs or logs them. Dry
-run and live run then share every line of decision code, which fixes the dry run count
-bug by construction. A failed move is reported back so the next tick retries, as today.
+`planTick()` takes the roster, the saved state, the server's settings and the time, and
+returns the next state plus an ordered list of actions (`broadcast`, `restart`, `message`,
+`move`). It never modifies the state it was given. As it walks the roster it updates its
+own head counts for each move it plans, so later decisions see earlier ones as if they
+had gone through. `src/executor.js` then performs the actions in order, or in a dry run
+logs them. Dry run and live run share every line of decision code, which is what fixed
+the dry run count bug.
+
+Moves are recorded in the planned state as *not done*: the player's current side, their
+old `movedAt`, and whether they are now placed. The executor calls `applyMoveSucceeded()`
+only for a move the server accepted, which records the new side and time and counts a
+closed-side clear. So a refused move, a dry run, or a crash between planning and doing
+all leave a state that matches the server, and the next tick retries. The executor keeps
+its own tally of moves that really happened for the `now V26/M24` log lines.
+
+If a move fails, the decisions planned after it in that tick assumed it went through, so
+they can be off by one for that tick. The next tick reads the real roster and corrects
+it. Before step 4 the code used the real result immediately; the difference only shows
+when the server refuses moves.
 
 ### Config is resolved once per server
 
@@ -161,9 +181,12 @@ Each step leaves `node selftest.js` and `node stress.js 10` green.
    than an empty server. Atomic state writes, schema version, pruning, lockfile. The
    balancer accepts injected `log`, `now`, `clientFor` and `store`, with defaults that
    keep the existing tests unchanged.
-4. **Policy modules and executor.** Split `processServer()` into `policy/*` and
-   `executor.js` as above. Fixes the dry run bug; promote its test. Move entry points
-   into `src/` and `bin/`.
+4. **[done] Policy modules and executor.** `processServer()` is now fetch, `planTick()`,
+   `execute()`. Every existing test passed unchanged against the split; the dry run test
+   was then promoted to a normal check and extended to compare the exact moves and to
+   confirm a dry run doesn't repeat them on later ticks. New tests cover a refused move
+   being retried and `planTick()` leaving its input alone. Code moved to `src/` and
+   `bin/`, with shims at the root.
 5. **Tests on `node:test`.** Port `selftest.js` scenarios one for one, switch them from
    patching `globalThis.fetch` and `Date.now` to injected fakes, add unit tests for the
    pure policy functions, keep `stress.js` as the invariant campaign.
@@ -173,10 +196,10 @@ Each step leaves `node selftest.js` and `node stress.js 10` green.
 
 Roughly in order of value for effort.
 
-- **Dry run summary.** "Would end at 26/24 after 9 moves" per tick with any moves. Nearly
-  free after step 4.
+- **Dry run summary.** "Would end at 26/24 after 9 moves" per tick with any moves. The
+  plan already has the numbers; it only needs a log line.
 - **Reload config on `SIGHUP`** without losing state.
-- **Read-only status endpoint** (the TODO in `balancer.js`): current counts, recent
+- **Read-only status endpoint** (the TODO in `src/balancer.js`): current counts, recent
   actions, match history. Opt-in and bound to `127.0.0.1` by default, because the tool's
   security pitch is that it opens no ports.
 - **JSON log output** for people shipping logs to Loki or ELK.

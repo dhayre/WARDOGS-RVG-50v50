@@ -4,7 +4,7 @@
   "description": "Team balancer for WARDOGS 50v50 servers. Evens the sides without dragging settled players out of a fight, keeps clans together, closes the third faction. Talks to your server RCON. No database, no dependencies.",
   "main": "balancer.js",
   "bin": {
-    "wd-balancer": "index.js"
+    "wd-balancer": "bin/wd-balancer.js"
   },
   "scripts": {
     "start": "node index.js",
@@ -28,6 +28,7 @@
   "files": [
     "index.js",
     "balancer.js",
+    "bin/",
     "src/",
     "selftest.js",
     "stress.js",

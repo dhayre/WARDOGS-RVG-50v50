@@ -721,7 +721,8 @@ function team(n, fac, prefix) {
   }
 
   // 44. dry run has to say what a real run would do. it used to judge every player
-  //     against the starting counts, so a 35/15 boundary read as 35 moves, not ~9.
+  //     against the starting counts, so a 35/15 boundary read as 35 moves, not 9.
+  //     same players, same sides, and it doesnt keep "moving" them on later ticks.
   {
     const run = async (dryRun) => {
       const world = fakeServer({ players: [...team(35, RED), ...team(15, GREEN, 'G')] });
@@ -730,11 +731,60 @@ function team(n, fac, prefix) {
       await bal.tick();
       world.map = 'Ozeti';
       await bal.tick();
-      return dryRun ? logs.filter((l) => l.includes('WOULD MOVE')).length : world.moves.length;
+      const nameOf = (id) => world.players.find((p) => p.id === id).name;
+      const moves = dryRun
+        ? logs.filter((l) => l.includes('WOULD MOVE')).map((l) => l.replace(/^.*WOULD MOVE (\S+) \S+ -> (\S+).*$/, '$1 -> $2'))
+        : world.moves.map((m) => `${nameOf(m.id)} -> ${m.to}`);
+      await bal.tick();
+      await bal.tick();
+      const later = dryRun ? logs.filter((l) => l.includes('WOULD MOVE')).length - moves.length : 0;
+      return { moves: moves.sort(), later };
     };
     const real = await run(false);
     const dry = await run(true);
-    knownBug('dry run reports the same number of moves a real run makes', dry, real);
+    check('dry run names the same moves a real run makes, once',
+      [dry.moves.length, dry.moves, dry.later], [real.moves.length, real.moves, 0]);
+  }
+
+  // 44b. a move the server refuses is not written down as done. the player is
+  //      retried next tick, and a refused clear off the closed side isnt counted.
+  {
+    const world = fakeServer({ players: [...team(25, RED), ...team(20, GREEN, 'G')] });
+    installStub(world);
+    const stub = globalThis.fetch;
+    let refuse = 1;
+    globalThis.fetch = async (url, opt) => {
+      if (opt && opt.method === 'PATCH' && refuse > 0) { refuse--; return { ok: false, status: 500, json: async () => ({}) }; }
+      return stub(url, opt);
+    };
+    const { bal, logs } = makeBalancer();
+    await bal.tick();
+    world.players.push({ id: '999201', name: 'Stubborn', fac: BLUE });
+    await bal.tick();                                   // refused
+    const afterRefusal = [bal.state['test'].known['999201'].fac, bal.state['test'].matchClosedClears];
+    await bal.tick();                                   // retried, goes through
+    globalThis.fetch = stub;
+    check('a refused move is retried next tick and not counted until it lands',
+      [afterRefusal, logs.some((l) => l.includes('move FAILED Stubborn')), world.moves.map((m) => m.to),
+       bal.state['test'].known['999201'].fac, bal.state['test'].matchClosedClears],
+      [[BLUE, 0], true, [GREEN], GREEN, 1]);
+  }
+
+  // 44c. planning is pure: it hands back a new state and leaves the one it was
+  //      given alone, so a crash between deciding and doing loses nothing.
+  {
+    const { planTick } = require('./src/policy/plan');
+    const { resolveServer, mergeConfig } = require('./src/config');
+    const cfg = mergeConfig({ closedFaction: BLUE, servers: [{ name: 's' }] });
+    const prev = { seeded: true, known: { '1': { fac: RED, movedAt: 0, placed: false } }, messaged: {},
+                   matchSig: 'M|', matchScoreSum: 0, matchPeak: {} };
+    const frozen = JSON.stringify(prev);
+    const plan = planTick({ players: [{ id: '1', fac: RED, tag: null, name: 'a' }, { id: '2', fac: BLUE, tag: null, name: 'b' }],
+      status: { ok: true, map: 'M', experiences: [], scores: [0, 0, 0] }, health: { ok: true, uptimeSeconds: 5 } },
+      prev, resolveServer(cfg, cfg.servers[0]), 1000);
+    check('planTick leaves its input state untouched and returns the moves to make',
+      [JSON.stringify(prev) === frozen, plan.actions.filter((a) => a.type === 'move').map((a) => [a.id, a.to])],
+      [true, [['2', GREEN]]]);
   }
 
   /* 34 and 35 drive the real index.js instead of a copy of its logic. a test that
