@@ -28,7 +28,7 @@ cd WARDOGS-RVG-50v50
 node selftest.js
 ```
 
-Get `36 passed, 0 failed` before you change anything, so you know your starting from a
+Get `fail 0` at the end before you change anything, so you know your starting from a
 working base.
 
 Then change what you want, and run the tests again:
@@ -45,7 +45,7 @@ Before you open a PR that touches the placing logic, run the stress harness as w
 node stress.js
 ```
 
-That throws 660 randomised servers at it with people joining, quitting and hopping sides,
+That throws 840 randomised servers at it with people joining, quitting and hopping sides,
 and checks the invariants after every tick. Takes a couple of minutes. If it prints a seed,
 paste that seed in the PR, becuase it reproduces the failure exactly.
 
@@ -63,8 +63,9 @@ section on it in the readme.
 Pull requests welcome. Before you open one:
 
 1. `node selftest.js` passes.
-2. If youve added behaviour, add a test for it. The file is `selftest.js`, the pattern is
-   obvious, copy the nearest one.
+2. If youve added behaviour, add a test for it. They live in `test/`, one file per area:
+   `rules`, `rescue-announce`, `config`, `state` and `api` run scenarios against a fake
+   server, and `policy` tests the rule functions on their own. Copy the nearest one.
 3. If youve changed behaviour thats described in the readme, update the readme too.
    Otherwise the readme is now lying and somebody wastes an evening on it.
 

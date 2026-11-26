@@ -13,11 +13,12 @@
  * no network, no config, no server. it never leaves the machine.
  *
  * Invariants checked on every tick of every run:
- *   I1  no move ever targets the closed faction
+ *   I1  no move ever targets the closed faction (any of the three, or none)
  *   I2  no settled player is moved mid-match (only joiners, self-switchers,
  *       closed-faction occupants, or players at a match boundary may move)
  *   I3  the closed faction empties and stays empty
- *   I4  with no churn, the gap converges to <= tolerance and stays there
+ *   I4  with no churn, the gap converges to <= tolerance and stays there. the gap is
+ *       the spread across the open sides: two of them, or all three
  *   I5  no player is moved twice inside the move cooldown
  *   I6  memory (the known-player map) stays bounded by the live player count
  *   I7  no oscillation: nobody is bounced back and forth indefinitely
@@ -30,7 +31,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { Balancer, RED, GREEN, BLUE } = require('./balancer');
+const { Balancer, FACTIONS, RED, GREEN, BLUE } = require('./balancer');
+const { RconClient } = require('./src/api');
 
 /* ---------- deterministic PRNG so every failure is reproducible ---------- */
 function rng(seed) {
@@ -43,10 +45,9 @@ function rng(seed) {
   };
 }
 
-/* ---------- fake clock so we can simulate hours in milliseconds ---------- */
-const realNow = Date.now;
+/* ---------- fake clock so we can simulate hours in milliseconds ----------
+ * handed to the balancer as its clock. nothing global is touched. */
 let CLOCK = 1700000000000;
-Date.now = () => CLOCK;
 function advance(ms) { CLOCK += ms; }
 
 /* ---------- a simulated WARDOGS server ----------------------------------- */
@@ -69,8 +70,9 @@ function makeWorld(rand, opts) {
   return { players, map: 'Bakurani', scores: 120, uptime: 9000, moves: [], broadcasts: [], restarts: 0, down: false, malformed: false };
 }
 
-function installStub(world) {
-  globalThis.fetch = async (url, opt) => {
+// the fake server's side of the RCON api, handed to a real RconClient as its fetch
+function fakeFetch(world) {
+  return async (url, opt) => {
     const method = (opt && opt.method) || 'GET';
     const route = new URL(url).pathname;
     if (world.down) throw new Error('ECONNREFUSED');
@@ -111,7 +113,7 @@ async function run(seed, cfgOverrides, churn, ticks) {
     blue: Math.floor(rand() * 8),
     clans: Math.floor(rand() * 4),
   });
-  installStub(world);
+  const fetch = fakeFetch(world);
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stress-'));
   const cfg = Object.assign({
@@ -121,7 +123,17 @@ async function run(seed, cfgOverrides, churn, ticks) {
     announce: { everyMinutes: 60, minPlayers: 1 },
     servers: [{ name: 's', host: '10.0.0.1', port: 7779, token: 't' }],
   }, cfgOverrides || {});
-  const bal = new Balancer(cfg, () => {});
+  const bal = new Balancer(cfg, {
+    log: () => {},
+    now: () => CLOCK,
+    clientFor: (server) => new RconClient(server, { fetch }),
+  });
+  const closed = cfg.closedFaction || null;
+  const open = FACTIONS.filter((f) => f !== closed);
+  const spread = () => {
+    const n = open.map((f) => world.players.filter((p) => p.fac === f).length);
+    return Math.max(...n) - Math.min(...n);
+  };
 
   const V = [];                       // violations
   const moveTimes = {};               // id -> [timestamps]
@@ -154,7 +166,7 @@ async function run(seed, cfgOverrides, churn, ticks) {
       world.players.splice(Math.floor(rand() * world.players.length), 1);
     }
     if (churn.collapseChance && rand() < churn.collapseChance) {
-      const side = rand() < 0.5 ? RED : GREEN;
+      const side = open[Math.floor(rand() * open.length)];
       const n = 12 + Math.floor(rand() * 14);           // 12 to 25 of them walk
       let gone = 0;
       world.players = world.players.filter((p) => {
@@ -164,8 +176,10 @@ async function run(seed, cfgOverrides, churn, ticks) {
     }
     if (rand() < churn.switchChance && world.players.length > 2) {
       const p = world.players[Math.floor(rand() * world.players.length)];
-      if (p.fac === RED || p.fac === GREEN) {
-        p.fac = p.fac === RED ? GREEN : RED; pendingSwitched.add(p.id);
+      if (open.includes(p.fac)) {
+        const others = open.filter((f) => f !== p.fac);
+        p.fac = others.length === 1 ? others[0] : others[Math.floor(rand() * others.length)];
+        pendingSwitched.add(p.id);
       }
     }
     if (rand() < churn.mapChance) {
@@ -178,7 +192,7 @@ async function run(seed, cfgOverrides, churn, ticks) {
     if (rand() < churn.flapChance) { world.down = !world.down; }
     if (rand() < churn.malformedChance) { world.malformed = true; } else { world.malformed = false; }
 
-    const beforeClosed = world.players.filter((p) => p.fac === BLUE).map((p) => p.id);
+    const beforeClosed = closed ? world.players.filter((p) => p.fac === closed).map((p) => p.id) : [];
     const restartsBefore = world.restarts;
     const sawServer = !world.down && !world.malformed;
     const joinedThisTick = new Set(pendingJoined);
@@ -194,7 +208,7 @@ async function run(seed, cfgOverrides, churn, ticks) {
 
     for (const m of world.moves) {
       // I1
-      if (m.to === BLUE) V.push(`I1 move to closed faction: ${m.id}`);
+      if (closed && m.to === closed) V.push(`I1 move to closed faction: ${m.id}`);
       // I2
       const legit = joinedThisTick.has(m.id) || switchedThisTick.has(m.id) ||
                     beforeClosed.includes(m.id) || boundaryThisTick || restartedThisTick;
@@ -218,9 +232,7 @@ async function run(seed, cfgOverrides, churn, ticks) {
     // players plus whoever could plausibly have left inside that window
     if (known > world.players.length + 160) V.push(`I6 known map ${known} unbounded vs ${world.players.length} live`);
 
-    const r = world.players.filter((p) => p.fac === RED).length;
-    const g = world.players.filter((p) => p.fac === GREEN).length;
-    gapSamples.push(Math.abs(r - g));
+    gapSamples.push(spread());
   }
 
   // ---- quiescence: stop all churn and let it settle -----------------------
@@ -236,15 +248,14 @@ async function run(seed, cfgOverrides, churn, ticks) {
     settleTicks++;
     if (world.moves.length === 0) break;
   }
-  const finalR = world.players.filter((p) => p.fac === RED).length;
-  const finalG = world.players.filter((p) => p.fac === GREEN).length;
-  const finalBlue = world.players.filter((p) => p.fac === BLUE).length;
+  const finalGap = spread();
+  const finalClosed = closed ? world.players.filter((p) => p.fac === closed).length : 0;
 
   // I3
-  if (cfg.closedFaction && finalBlue > 0) V.push(`I3 closed faction still has ${finalBlue} after settling`);
+  if (closed && finalClosed > 0) V.push(`I3 closed faction still has ${finalClosed} after settling`);
   // I4 (only meaningful if enough players to balance)
-  if (world.players.length >= 8 && Math.abs(finalR - finalG) > cfg.gapTolerance) {
-    V.push(`I4 settled gap ${Math.abs(finalR - finalG)} > tolerance ${cfg.gapTolerance}`);
+  if (world.players.length >= 8 && finalGap > cfg.gapTolerance) {
+    V.push(`I4 settled gap ${finalGap} > tolerance ${cfg.gapTolerance}`);
   }
   // I7 oscillation
   const worst = Object.entries(moveCounts).sort((a, b) => b[1] - a[1])[0];
@@ -255,7 +266,7 @@ async function run(seed, cfgOverrides, churn, ticks) {
 
   return {
     seed, violations: V,
-    players: world.players.length, finalGap: Math.abs(finalR - finalG), finalBlue,
+    players: world.players.length, finalGap, finalClosed,
     boundaries, maxMovesInTick, maxKnown, worstMoves, restarts: world.restarts,
     meanGap: gapSamples.reduce((a, b) => a + b, 0) / (gapSamples.length || 1),
     settleTicks,
@@ -276,6 +287,9 @@ async function run(seed, cfgOverrides, churn, ticks) {
     { name: 'rescue: mass quits',     churn: { joinsPerTick: 1, joinChance: 0.10, leaveChance: 0.15, switchChance: 0.1,  mapChance: 0.01, flapChance: 0,    malformedChance: 0, collapseChance: 0.02 }, ticks: 400, cfg: { rescue: { enabled: true, graceMinutes: 1, warnSeconds: 30, scoreLead: 15, cooldownMinutes: 5 } } },
     { name: 'rescue OFF, same quits', churn: { joinsPerTick: 1, joinChance: 0.10, leaveChance: 0.15, switchChance: 0.1,  mapChance: 0.01, flapChance: 0,    malformedChance: 0, collapseChance: 0.02 }, ticks: 400 },
     { name: 'all three open',         churn: { joinsPerTick: 2, joinChance: 0.5,  leaveChance: 0.4, switchChance: 0.3,  mapChance: 0.04, flapChance: 0,    malformedChance: 0 },    ticks: 120, cfg: { closedFaction: null } },
+    { name: 'three open, rescue on',  churn: { joinsPerTick: 1, joinChance: 0.10, leaveChance: 0.15, switchChance: 0.1,  mapChance: 0.01, flapChance: 0,    malformedChance: 0, collapseChance: 0.02 }, ticks: 400, cfg: { closedFaction: null, rescue: { enabled: true, graceMinutes: 1, warnSeconds: 30, scoreLead: 15, cooldownMinutes: 5 } } },
+    { name: 'Valkyra closed',         churn: { joinsPerTick: 2, joinChance: 0.5,  leaveChance: 0.4, switchChance: 0.3,  mapChance: 0.04, flapChance: 0,    malformedChance: 0 },    ticks: 120, cfg: { closedFaction: RED } },
+    { name: 'Manticore closed',       churn: { joinsPerTick: 2, joinChance: 0.5,  leaveChance: 0.4, switchChance: 0.3,  mapChance: 0.04, flapChance: 0,    malformedChance: 0 },    ticks: 120, cfg: { closedFaction: GREEN } },
   ];
 
   const RUNS_PER_PROFILE = Number(process.argv[2] || 60);
@@ -295,7 +309,7 @@ async function run(seed, cfgOverrides, churn, ticks) {
         allViolations.push(`[${prof.name} seed ${seed}] ` + r.violations.slice(0, 3).join(' | '));
       }
       stats.gaps.push(r.finalGap);
-      stats.blue += r.finalBlue;
+      stats.blue += r.finalClosed;
       stats.osc = Math.max(stats.osc, r.worstMoves);
       stats.maxTick = Math.max(stats.maxTick, r.maxMovesInTick);
       stats.settle.push(r.settleTicks);
@@ -313,8 +327,6 @@ async function run(seed, cfgOverrides, churn, ticks) {
       meanTicksToSettle: mean(stats.settle).toFixed(1),
     });
   }
-
-  Date.now = realNow;
 
   console.log('\nwd-balancer stress campaign\n');
   console.log(`  ${totalRuns} randomised runs, ${totalTicks} ticks, ${RUNS_PER_PROFILE} seeds per profile\n`);
