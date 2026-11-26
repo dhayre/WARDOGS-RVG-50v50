@@ -377,13 +377,17 @@ and rearanging a live game.
 case they go to the clan, unless that would break the cap or blow the gap out.
 
 **The closed side gets emptied constantly.** By default `Lonestar` is shut, so anyone who
-picks it gets moved within a couple of seconds. Set `closedFaction` to `null` if you want
-all three open.
+picks it gets moved within a couple of seconds. Any of the three can be the closed one.
+Set `closedFaction` to `null` if you want all three open, and then every rule here works
+across three sides instead of two: the gap is the biggest side minus the smallest, and
+new arrivals go to the lightest of the three.
 
 **The closed door.** This is the anti stack rule. A settled player who switches sides
 THEMSELFS mid match gets put back if the side they jumped to is full, or is allready
-heavier than the tolerance. Jumping to the LIGHTER side is allways fine, because somebody
-volenteering to even it up is doing your job for you. Players who just play are never
+heavier than the tolerance. Heavier means heavier than the side they left. Jumping to the
+LIGHTER side is allways fine, because somebody volenteering to even it up is doing your job
+for you. Nobody is ever bounced onto the closed side: if they came off it, they get placed
+like a new arrival instead. Players who just play are never
 touched by this, and thats what keeps the no mid match moves promise honest.
 
 **At a new match the teams get sorted.** It spots a new match three ways: the map rotated,
@@ -436,7 +440,7 @@ server list.
 | `dryRun` | `false` | Decide and log everything, move nobody. |
 | `sideCap` | `50` | Hard max per side. `32` for 32v32, and so on. |
 | `gapTolerance` | `3` | How uneven its allowed to get before it acts. |
-| `closedFaction` | `"Lonestar"` | Side to keep empty. `null` leaves all three open. |
+| `closedFaction` | `"Lonestar"` | Side to keep empty: `"Valkyra"`, `"Manticore"` or `"Lonestar"`. `null` balances all three. |
 | `clanGrouping` | `true` | Try and keep clan tags together. |
 | `exempt` | `[]` | Steam ids the balancer never touches. Your admins. |
 | `moveCooldownSeconds` | `30` | Minimum gap between moves for one player. |
@@ -451,7 +455,9 @@ server list.
 Per server you need `name`, `host`, `port` and either `token` (the RCON password) or
 `tokenEnv` (the name of an environment variable holding it). You can also set
 `enabled: false` to park one, and override `sideCap`, `gapTolerance`, `closedFaction`,
-`clanGrouping`, `joinMessage` or the `announce` timing for just that server.
+`clanGrouping`, `joinMessage`, `moveCooldownSeconds`, `bounceCooldownSeconds`, `announce`
+or `rescue` for just that server. A server's `exempt` list is added to the global one.
+Overrides get the same checks as the global settings.
 
 The `name` is only a label but its the key the state gets saved under. Rename a server and
 it treats it as a brand new one and re seeds.
@@ -506,6 +512,10 @@ server is stuck on the small side:
 The line is **40%**. On top of that it needs at least 20 players on and a gap of at
 least 8, so it leaves quiet servers alone and cant trip over 12 v 6.
 
+With all three sides open, 40% on the smallest side is impossible, so the line scales to
+`minorityShare * 2 / 3`, about **26.7%**. Thats the same 80% of a fair share as 40% is
+with two sides. The gap is the biggest side minus the smallest.
+
 **And it has to actualy be costing somebody the match.** If the score is still close its
 not hurting anyone, so nothing happens no matter how lopsided it looks. The leader has to
 be more than **15 points** clear.
@@ -525,7 +535,7 @@ After a restart theres a 15 minute cooldown so it cant sit there restarting on a
 | Key | Default | What it does |
 |---|---|---|
 | `rescue.enabled` | `false` | The whole thing. Off unless you turn it on. |
-| `rescue.minorityShare` | `0.40` | Small side must be at least this much of the server. |
+| `rescue.minorityShare` | `0.40` | Small side must be at least this much of the server. Scaled by 2/3 with three open sides. |
 | `rescue.minPlayers` | `20` | Below this it leaves the server alone. |
 | `rescue.minGap` | `8` | Absolute gap needed as well as the share. |
 | `rescue.scoreLead` | `15` | Leader must be this far ahead before anything happens. |
@@ -577,8 +587,9 @@ In `stateDir`:
 
 - `balancer-state.json`, the per server memory. Safe to delete while its stopped. If you
   do, it just re seeds and leaves the current round alone.
-- `match-history.json`, the last 300 matches with how long they ran, peak players a side,
-  the worst gap it reached and how many times the closed side had to be cleared. Handy
+- `match-history.json`, the last 300 matches with how long they ran, peak players a side
+  (`peak`, keyed by faction), the worst gap it reached and how many times the closed side
+  had to be cleared. Handy
   when somebody insists the teams are allways stacked and youd like to actualy check.
 
 ---
@@ -658,7 +669,7 @@ anyway. The only mid match move is putting somebody back who chose to jump onto 
 stacked side.
 
 **"A brand new account wants my RCON password."** Reasonable suspicion. So: zero
-dependencies, nothing to install, two files you can read in ten minutes, and the only
+dependencies, nothing to install, a handful of small files you can read in ten minutes, and the only
 address it ever contacts is the one in your own config. Read `balancer.js` and check. The
 whole point of shipping it small is that you dont have to trust me.
 
@@ -678,8 +689,9 @@ packaging of them has not moved a real player yet. Thats why theres a `--dry-run
 
 ## A note on the code
 
-Its about 700 lines across two files and the comments are honest about why things are the
-way they are, including the bits that got learned the hard way. If your extending it, the
+Its a few small files and the comments are honest about why things are the way they are,
+including the bits that got learned the hard way. How its laid out, where its going and
+the plan for getting there is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). If your extending it, the
 rules above are the contract. Break those and it stops being a balancer people leave
 running.
 

@@ -3,6 +3,36 @@
 Newest at the top. Version numbers follow [semver](https://semver.org): the first number
 changes if I break your config, the second if theres somthing new, the third for fixes.
 
+## Unreleased
+
+**Fixed**
+
+- `closedFaction` only worked when it was `Lonestar`. With `Valkyra` or `Manticore` closed
+  it never cleared the closed side and could move players onto it. Any of the three works
+  now.
+- `closedFaction: null` ignored the third side instead of balancing it. All three sides are
+  balanced now: placement, the closed door, clans, match boundaries and rescue.
+- The closed door could bounce somebody back onto the closed side if they had been seeded
+  there and switched before being cleared. They get placed properly now.
+- Per server `rescue`, `announce`, `closedFaction` and cooldowns were never validated. They
+  are now, with the same rules as the global settings.
+
+**Changed**
+
+- `--check` lists every problem in the config at once instead of stopping at the first.
+- `moveCooldownSeconds` and `bounceCooldownSeconds` can be set per server. A non-number in
+  either is rejected; before, it meant nobody was ever moved.
+- Rescue works with three open sides. `minorityShare` scales to `minorityShare * 2 / 3`.
+- `match-history.json` records `peak` as a map keyed by faction instead of `peakRed` and
+  `peakGreen`. State files from 1.0.0 are migrated on load.
+- Config handling moved to `src/config.js` and the faction table to `src/factions.js`.
+
+**Known**
+
+- Dry run still overstates moves at a match boundary, because it never updates its counts
+  as it goes. There's a test for it, and the fix comes with the planned split between
+  deciding and doing in `docs/ARCHITECTURE.md`.
+
 ## 1.0.0
 
 First public release.

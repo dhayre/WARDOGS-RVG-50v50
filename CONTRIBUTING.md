@@ -28,7 +28,7 @@ cd WARDOGS-RVG-50v50
 node selftest.js
 ```
 
-Get `36 passed, 0 failed` before you change anything, so you know your starting from a
+Get `0 failed` before you change anything, so you know your starting from a
 working base.
 
 Then change what you want, and run the tests again:
@@ -45,7 +45,7 @@ Before you open a PR that touches the placing logic, run the stress harness as w
 node stress.js
 ```
 
-That throws 660 randomised servers at it with people joining, quitting and hopping sides,
+That throws 840 randomised servers at it with people joining, quitting and hopping sides,
 and checks the invariants after every tick. Takes a couple of minutes. If it prints a seed,
 paste that seed in the PR, becuase it reproduces the failure exactly.
 
